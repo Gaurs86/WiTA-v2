@@ -3,13 +3,12 @@ configs/__init__.py — Public surface of the configs package.
 
 Re-exports everything a typical import site needs so callers can write:
 
-    from configs import Config, DataConfig, TrainConfig
-    from configs import build_config_from_args
+    from wita_v2.configs import Config, DataConfig, TrainConfig
 
 instead of reaching into configs.default directly.
 """
 
-from configs.default import (
+from .default import (
     # Sub-configs
     VocabConfig,
     DataConfig,
