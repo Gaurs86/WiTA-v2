@@ -5,7 +5,7 @@ Re-implements WarmupMultiStepLR from WiTA baseline utils.py.
 from __future__ import annotations
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
-from configs.default import TrainConfig
+from ..configs.default import TrainConfig
 
 
 class WarmupMultiStepLR(_LRScheduler):

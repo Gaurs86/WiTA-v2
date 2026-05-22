@@ -26,8 +26,8 @@ from typing import Any
 import torch
 from PIL import Image
 
-from configs.default import AugConfig, DataConfig
-from datasets.transforms import (
+from ..configs.default import AugConfig, DataConfig
+from .transforms import (
     Compose,
     ClipToTensor,
     ClipNormalize,

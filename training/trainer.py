@@ -15,15 +15,33 @@ from __future__ import annotations
 import os, time, logging
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+import torch.amp as _amp
+from torch.amp import autocast as _autocast_cls
+
+# Compatibility shim: pick the right AMP device at runtime
+def _make_scaler(device):
+    """Return a GradScaler appropriate for the device (no-op on CPU)."""
+    if hasattr(device, 'type'):
+        dtype = device.type
+    else:
+        dtype = str(device).split(':')[0]   # 'cuda', 'cpu', 'mps'
+    return _amp.GradScaler(dtype, enabled=(dtype == 'cuda'))
+
+def _autocast(device):
+    """Context manager for AMP; no-op on CPU."""
+    if hasattr(device, 'type'):
+        dtype = device.type
+    else:
+        dtype = str(device).split(':')[0]
+    return _autocast_cls(device_type=dtype, enabled=(dtype == 'cuda'))
 from torch.utils.data import DataLoader
 
-from configs.default import Config
-from datasets.vocab import StrLabelConverter
-from training.losses import hybrid_loss, prepare_attn_targets, get_lambda_ctc
-from training.schedulers import build_optimizer, build_scheduler
-from evaluation.evaluator import evaluate_cer, print_sample_table
-from utils.checkpoint import save as ckpt_save, load as ckpt_load
+from ..configs.default import Config
+from ..datasets.vocab import StrLabelConverter
+from .losses import hybrid_loss, prepare_attn_targets, get_lambda_ctc
+from .schedulers import build_optimizer, build_scheduler
+from ..evaluation.evaluator import evaluate_cer, print_sample_table
+from ..utils.checkpoint import save as ckpt_save, load as ckpt_load
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +65,7 @@ def _train_epoch(
 
         tgt_in, tgt_out, tgt_pad = prepare_attn_targets(labels, label_lens, cfg.vocab)
 
-        with autocast():
+        with _autocast(cfg.device):
             ctc_lp, attn_logits = model(clips, input_lens, tgt_in, tgt_pad)
             loss, ctc_v, attn_v = hybrid_loss(
                 ctc_lp, attn_logits, labels, tgt_out,
@@ -97,7 +115,7 @@ def train(
     total_steps = cfg.train.num_epochs * max(1, len(train_loader) // cfg.train.accum_steps)
     optimizer   = build_optimizer(model.parameters(), cfg.train)
     scheduler   = build_scheduler(optimizer, total_steps, cfg.train)
-    scaler      = GradScaler()
+    scaler      = _make_scaler(cfg.device)
 
     start_epoch = 0
     best_cer    = float("inf")

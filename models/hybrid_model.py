@@ -15,10 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from configs.default import Config
-from models.encoders.resnet3d import VideoResNet, build_encoder
-from models.modules.recurrent import build_recurrent_head, CTCProjection
-from models.decoders.attention import AttentionDecoder
+from ..configs.default import Config
+from .encoders.resnet3d import VideoResNet, build_encoder
+from .modules.recurrent import build_recurrent_head, CTCProjection
+from .decoders.attention import AttentionDecoder
 
 
 class WiTAHybridModel(nn.Module):

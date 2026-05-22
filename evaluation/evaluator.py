@@ -9,10 +9,10 @@ from typing import Literal
 import torch
 from torch.utils.data import DataLoader
 
-from configs.default import Config
-from datasets.vocab import StrLabelConverter, cer as compute_cer
-from evaluation.metrics import decode_ctc_indices, decode_attn_indices
-from training.losses import prepare_attn_targets
+from ..configs.default import Config
+from ..datasets.vocab import StrLabelConverter, cer as compute_cer
+from .metrics import decode_ctc_indices, decode_attn_indices
+from ..training.losses import prepare_attn_targets
 
 logger = logging.getLogger(__name__)
 

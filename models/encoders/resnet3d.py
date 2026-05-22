@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from configs.default import EncoderConfig
+from ...configs.default import EncoderConfig
 
 
 # ---------------------------------------------------------------------------

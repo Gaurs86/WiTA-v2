@@ -17,7 +17,7 @@ import math
 import torch
 import torch.nn as nn
 
-from configs.default import AttnDecoderConfig, VocabConfig
+from ...configs.default import AttnDecoderConfig, VocabConfig
 
 
 class PositionalEncoding(nn.Module):

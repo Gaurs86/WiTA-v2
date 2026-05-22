@@ -43,7 +43,7 @@ from __future__ import annotations
 from typing import Callable, Type
 import torch.nn as nn
 
-from configs.default import EncoderConfig
+from ...configs.default import EncoderConfig
 
 
 # ---------------------------------------------------------------------------

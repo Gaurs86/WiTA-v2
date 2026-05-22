@@ -32,10 +32,10 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as T
 
-from configs.default import Config
-from datasets.vocab import StrLabelConverter, make_converter
-from datasets.augmentations import WiTAClipAugmentation
-from datasets.collate import make_pad_collate
+from ..configs.default import Config
+from .vocab import StrLabelConverter, make_converter
+from .augmentations import WiTAClipAugmentation
+from .collate import make_pad_collate
 
 logger = logging.getLogger(__name__)
 

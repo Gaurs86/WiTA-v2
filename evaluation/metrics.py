@@ -1,7 +1,7 @@
 """evaluation/metrics.py — CER / WER metric helpers."""
 from __future__ import annotations
-from datasets.vocab import cer, wer          # self-contained implementations
-from datasets.vocab import StrLabelConverter
+from ..datasets.vocab import cer, wer          # self-contained implementations
+from ..datasets.vocab import StrLabelConverter
 import torch
 
 
