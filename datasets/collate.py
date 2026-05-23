@@ -5,11 +5,20 @@ Re-implements all calc_seq_len_* functions from WiTA baseline utils.py.
 These compute the temporal length after the 3-D ResNet encoder's temporal
 down-sampling, which is required as input_lengths for nn.CTCLoss.
 
-Every function signature and formula is identical to the baseline so that
-checkpoints remain compatible.
+FIX (Bug 2)
+-----------
+The original code padded label tensors with value 0 (the CTC blank index),
+but VocabConfig.pad_idx = N+3 (29 for English).  The attention-decoder mask
+`tgt_key_padding = tgt_input.eq(vocab.pad_idx)` therefore never fired,
+leaving blank-padded positions unmasked.  This caused two problems:
+  1. The attention decoder attended to blank (0) tokens as if they were
+     real content, degrading every cross-attention computation.
+  2. CrossEntropyLoss was computed over blank-padded target positions (the
+     loss is supposed to ignore pad_idx via ignore_index=pad_idx, but the
+     padded tokens were 0=blank, not pad_idx, so they were NOT ignored).
 
-Additionally provides make_pad_collate() which returns a pad_collate function
-configured for a specific (model_arch, lang, num_res_layers) combination.
+Fix: make_pad_collate() now accepts `pad_idx` and passes it as
+`padding_value` to pad_sequence for labels.
 """
 
 from __future__ import annotations
@@ -89,10 +98,6 @@ def get_seq_len_fn(
     lang:           str,
     num_res_layers: int,
 ) -> Callable[[int], int]:
-    """
-    Return the correct seq-len function for a given (arch, lang, layers) combo.
-    Mirrors the if/elif tree in baseline train.py pad_collate.
-    """
     english_or_kor1 = lang == "english" or (lang == "korean" and num_res_layers == 1)
 
     if english_or_kor1:
@@ -122,30 +127,33 @@ def make_pad_collate(
     arch:           str = "r3d",
     lang:           str = "english",
     num_res_layers: int = 1,
+    pad_idx:        int = 0,    # ← NEW: must be VocabConfig.pad_idx (N+3)
 ) -> Callable:
     """
     Return a pad_collate function bound to the given model / data config.
 
-    The returned function:
-      • Pads video tensors  [T, C, H, W]  along T  → [B, T_max, C, H, W]
-      • Pads label tensors  [L]            along L  → [B, L_max]
-      • Computes CTC input_lengths via the correct seq_len helper
-      • Returns (clips_pad, labels_pad, input_lens, label_lens)
+    Parameters
+    ----------
+    pad_idx : int
+        The padding token index from VocabConfig (= N+3, NOT 0).
+        Used as padding_value when stacking label tensors so that the
+        attention-decoder key-padding mask fires correctly.
 
-    Mirrors baseline pad_collate in train.py exactly.
-
-    pin_memory note
-    ---------------
-    Pinning is handled at the DataLoader level, not here.
+    Returns (clips_pad, labels_pad, input_lens, label_lens).
     """
     seq_len_fn = get_seq_len_fn(arch, lang, num_res_layers)
 
     def _pad_collate(batch: list[tuple[torch.Tensor, torch.Tensor]]):
         clips, labels = zip(*batch)
 
-        # Clips: each is [T, C, H, W] — pad along T
-        clips_pad  = pad_sequence(clips,  batch_first=True, padding_value=0.0)  # [B, T, C, H, W]
-        labels_pad = pad_sequence(labels, batch_first=True, padding_value=0)    # [B, L]
+        # Clips: each is [T, C, H, W] — pad along T with 0.0 (black frame)
+        clips_pad  = pad_sequence(clips, batch_first=True, padding_value=0.0)
+
+        # Labels: pad with pad_idx (N+3), NOT with blank (0).
+        # This ensures tgt_key_padding = tgt_input.eq(pad_idx) fires correctly
+        # inside prepare_attn_targets, and CrossEntropyLoss ignores these positions
+        # via ignore_index=pad_idx.
+        labels_pad = pad_sequence(labels, batch_first=True, padding_value=pad_idx)
 
         input_lens = torch.LongTensor([seq_len_fn(c.shape[0]) for c in clips])
         label_lens = torch.LongTensor([l.shape[0]             for l in labels])

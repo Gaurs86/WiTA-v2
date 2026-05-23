@@ -2,17 +2,16 @@
 datasets/dataset.py — WiTADataset and HuggingFace ZIP streaming pipeline.
 
 Self-contained: no imports from the original WiTA repo.
-Depends only on internal modules (configs, datasets/vocab, datasets/augmentations).
 
-Design
-------
-• ZIPs are downloaded one at a time and deleted immediately after parsing.
-• PNG bytes are stored in RAM (not decoded PIL Images) so forked DataLoader
-  workers don't blow up memory with copied Image objects.
-• PIL decoding happens lazily in __getitem__ (one clip per batch element).
-• Korean labels are hgtk-decomposed before StrLabelConverter encoding.
-• The Dataset yields (video_tensor [T, C, H, W], label_tensor [L]) —
-  identical to AirTypingDataset so the collate / training loop is unchanged.
+NOTE ON HYPHENS IN THE DISPLAY
+-------------------------------
+The qualitative sample table shows ground-truth words like "sug-gestion",
+"bre-eding", "com-mander".  These hyphens do NOT come from gt.txt — they
+are produced by StrLabelConverter.decode() mapping the consecutive-repeat
+separator token (index N+1 = '-') back to the '-' character.  For example,
+'suggestion' encodes as [..., g, SEP(N+1), g, ...] and decodes as
+"sug-gestion".  This is the baseline's intended representation and is NOT
+a data error.  The root issue was in VocabConfig (see configs/default.py).
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ import shutil
 import zipfile
 import random
 import logging
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -41,11 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Korean jamo decomposer (optional dependency — only for Korean data)
+# Korean jamo decomposer
 # ---------------------------------------------------------------------------
 
 def _decompose_korean(label: str) -> str:
-    """hgtk-decompose a Korean label (same as baseline data.py)."""
     try:
         import hgtk
         return hgtk.text.decompose(label)
@@ -58,7 +55,6 @@ def _decompose_korean(label: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _sorted_frame_names(names: list[str]) -> list[str]:
-    """Sort frame filenames by trailing integer (e.g. rgb_000001.png)."""
     def _key(f: str) -> int:
         m = re.search(r"(\d+)", os.path.basename(f))
         return int(m.group()) if m else 0
@@ -70,11 +66,6 @@ def _read_frames_from_zip(
     seq_prefix: str,
     max_frames: int,
 ) -> list[bytes] | None:
-    """
-    Read PNG frames for one sequence as raw bytes (no PIL decode).
-    Returns None if no valid frames are found.
-    Long clips are centre-truncated.
-    """
     all_names = zf.namelist()
     frames = [
         n for n in all_names
@@ -102,14 +93,10 @@ def _read_frames_from_zip(
 
 
 # ---------------------------------------------------------------------------
-# gt.txt parser — mirrors AirTypingDataset label loading
+# gt.txt parser
 # ---------------------------------------------------------------------------
 
 def _parse_gt(zf: zipfile.ZipFile, gt_path: str, lang: str) -> list[str]:
-    """
-    Parse a gt.txt from within a ZipFile.
-    Returns a list of label strings (line N = label for folder N).
-    """
     raw = zf.read(gt_path)
     if lang == "korean":
         try:
@@ -130,9 +117,6 @@ def _index_zip(
     lang:      str,
     max_frames:int,
 ) -> list[tuple[list[bytes], str]]:
-    """
-    Parse one ZIP; return list of (frame_bytes, raw_label) pairs.
-    """
     all_names = zf.namelist()
     gt_files  = [n for n in all_names if n.endswith("gt.txt")]
     samples: list[tuple[list[bytes], str]] = []
@@ -161,28 +145,20 @@ def _index_zip(
 # ---------------------------------------------------------------------------
 
 def stream_and_index(cfg: Config) -> list[tuple[list[bytes], str]]:
-    """
-    Download ZIPs one at a time, index frames+labels, delete each ZIP.
-    Returns a flat list of (frame_bytes, label_string) pairs.
-
-    HF cache is purged after each ZIP to reclaim blobs and lock files.
-    Raises RuntimeError if disk drops below 2 GB free.
-    """
     try:
         from huggingface_hub import list_repo_files, hf_hub_download
     except ImportError:
         raise ImportError("pip install huggingface_hub")
 
-    repo_id   = cfg.data.hf_repo_id
-    lang      = cfg.data.lang
-    max_zips  = cfg.data.max_zips
-    dl_dir    = cfg.data.download_dir
-    hf_cache  = cfg.data.hf_cache_dir
+    repo_id    = cfg.data.hf_repo_id
+    lang       = cfg.data.lang
+    max_zips   = cfg.data.max_zips
+    dl_dir     = cfg.data.download_dir
+    hf_cache   = cfg.data.hf_cache_dir
     max_frames = cfg.data.max_frames
 
     os.makedirs(dl_dir, exist_ok=True)
 
-    # Discover ZIPs
     all_files = list(list_repo_files(repo_id, repo_type="dataset"))
     lang_filters = {
         "english": lambda f: f.endswith(".zip") and "kor" not in f.lower(),
@@ -200,15 +176,10 @@ def stream_and_index(cfg: Config) -> list[tuple[list[bytes], str]]:
 
     for i, zip_name in enumerate(zip_files):
         logger.info("[%d/%d] Downloading %s", i + 1, len(zip_files), zip_name)
-
         local = hf_hub_download(
-            repo_id=repo_id,
-            filename=zip_name,
-            repo_type="dataset",
-            local_dir=dl_dir,
-            local_dir_use_symlinks=False,
+            repo_id=repo_id, filename=zip_name, repo_type="dataset",
+            local_dir=dl_dir, local_dir_use_symlinks=False,
         )
-
         try:
             with zipfile.ZipFile(local, "r") as zf:
                 batch = _index_zip(zf, lang, max_frames)
@@ -217,14 +188,12 @@ def stream_and_index(cfg: Config) -> list[tuple[list[bytes], str]]:
         except Exception as e:
             logger.error("Failed to process %s: %s", zip_name, e)
         finally:
-            # Always delete ZIP + purge HF cache
             if os.path.exists(local):
                 os.remove(local)
             if os.path.exists(hf_cache):
                 shutil.rmtree(hf_cache, ignore_errors=True)
             os.makedirs(hf_cache, exist_ok=True)
 
-        # Safety check
         free_gb = shutil.disk_usage("/").free / (1024 ** 3)
         logger.info("  Disk free: %.2f GB", free_gb)
         if free_gb < 2.0:
@@ -239,17 +208,6 @@ def stream_and_index(cfg: Config) -> list[tuple[list[bytes], str]]:
 # ---------------------------------------------------------------------------
 
 class WiTADataset(Dataset):
-    """
-    Map-style Dataset over (frame_bytes, label_string) pairs.
-
-    Parameters
-    ----------
-    samples   : from stream_and_index()
-    cfg       : project Config
-    mode      : 'train' | 'val' | 'test'
-    converter : StrLabelConverter for encoding labels
-    """
-
     def __init__(
         self,
         samples:   list[tuple[list[bytes], str]],
@@ -264,7 +222,6 @@ class WiTADataset(Dataset):
         self.converter = converter or make_converter(cfg.data.lang)
         self.augment   = WiTAClipAugmentation(cfg.aug, cfg.data, mode=mode)
 
-        # Spatial resize (mirrors baseline self.resize = transforms.Resize(112))
         img_size = cfg.data.img_size
         self.resize = T.Resize(img_size) if img_size != 224 else None
 
@@ -274,23 +231,19 @@ class WiTADataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         frame_bytes, raw_label = self.samples[idx]
 
-        # Decode bytes → PIL (inside worker, not main process)
         frames: list[Image.Image] = [
             Image.open(io.BytesIO(b)).convert("RGB") for b in frame_bytes
         ]
         if self.resize is not None:
             frames = [self.resize(f) for f in frames]
 
-        # Augment → [C, T, H, W]
         clip_ctw = self.augment(frames)
+        clip = clip_ctw.permute(1, 0, 2, 3)   # [T, C, H, W]
 
-        # Permute to [T, C, H, W] for pad_sequence (T-first)
-        clip = clip_ctw.permute(1, 0, 2, 3)
-
-        # Encode label
+        label = raw_label
         if self.lang == "korean":
-            raw_label = _decompose_korean(raw_label)
-        label_enc, _ = self.converter.encode(raw_label)
+            label = _decompose_korean(label)
+        label_enc, _ = self.converter.encode(label)
 
         return clip, label_enc
 
@@ -304,18 +257,12 @@ def make_dataloaders(
     samples:   list[tuple[list[bytes], str]] | None = None,
     converter: StrLabelConverter | None = None,
 ) -> tuple[DataLoader, DataLoader]:
-    """
-    Build train + val DataLoaders.
-
-    If samples is None, calls stream_and_index(cfg) automatically.
-    """
     if samples is None:
         samples = stream_and_index(cfg)
 
     converter = converter or make_converter(cfg.data.lang)
 
-    # Shuffle + split
-    rng = random.Random(cfg.data.seed)
+    rng  = random.Random(cfg.data.seed)
     data = samples.copy()
     rng.shuffle(data)
     split = int(len(data) * cfg.data.train_split)
@@ -324,35 +271,26 @@ def make_dataloaders(
     train_ds = WiTADataset(train_data, cfg, mode="train", converter=converter)
     val_ds   = WiTADataset(val_data,   cfg, mode="val",   converter=converter)
 
+    # Pass pad_idx so labels are padded with the correct token (Bug 2 fix).
     collate = make_pad_collate(
         arch=cfg.encoder.arch,
         lang=cfg.data.lang,
         num_res_layers=cfg.encoder.num_res_layers,
+        pad_idx=cfg.vocab.pad_idx,   # N+4, NOT 0
     )
 
-    # pin_memory only safe when num_workers == 0 on Kaggle
-    pin      = cfg.train.pin_memory and (cfg.train.num_workers == 0)
-    persist  = cfg.train.num_workers > 0 and cfg.train.persistent_workers
+    pin     = cfg.train.pin_memory and (cfg.train.num_workers == 0)
+    persist = cfg.train.num_workers > 0 and cfg.train.persistent_workers
 
     train_loader = DataLoader(
-        train_ds,
-        batch_size         = cfg.train.batch_size,
-        shuffle            = True,
-        num_workers        = cfg.train.num_workers,
-        collate_fn         = collate,
-        pin_memory         = pin,
-        persistent_workers = persist,
-        drop_last          = True,
+        train_ds, batch_size=cfg.train.batch_size, shuffle=True,
+        num_workers=cfg.train.num_workers, collate_fn=collate,
+        pin_memory=pin, persistent_workers=persist, drop_last=True,
     )
     val_loader = DataLoader(
-        val_ds,
-        batch_size         = cfg.train.batch_size,
-        shuffle            = False,
-        num_workers        = cfg.train.num_workers,
-        collate_fn         = collate,
-        pin_memory         = pin,
-        persistent_workers = persist,
-        drop_last          = False,
+        val_ds, batch_size=cfg.train.batch_size, shuffle=False,
+        num_workers=cfg.train.num_workers, collate_fn=collate,
+        pin_memory=pin, persistent_workers=persist, drop_last=False,
     )
 
     logger.info(

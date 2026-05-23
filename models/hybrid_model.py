@@ -1,13 +1,18 @@
 """
 models/hybrid_model.py — WiTAHybridModel.
 
-Fully self-contained. Builds all components from Config:
-  Encoder  : VideoResNet family  (models/encoders/resnet3d.py)
-  Recurrent: BiLSTM / BiGRU / Transformer / None  (models/modules/recurrent.py)
-  CTC head : Linear projection   (models/modules/recurrent.py)
-  Attention: Transformer decoder (models/decoders/attention.py)
+FIX (Bug 3 — AMP double-wrapping)
+-----------------------------------
+The original forward() wrapped its own body in torch.autocast().  The trainer
+also wrapped the loss computation in a second autocast scope.  This caused the
+model's fp16 activations to exit one autocast context and re-enter another,
+breaking the intended single-scope AMP flow and creating subtle precision
+inconsistencies near the CTC log-softmax boundary.
 
-No import from the original WiTA repo.
+Fix: torch.autocast() has been removed from model.forward().  AMP is now
+managed exclusively by the trainer (which wraps both the model forward pass
+AND the loss computation in a single `with autocast(...)` block).  This is
+the standard PyTorch AMP pattern and the correct approach for DataParallel.
 """
 
 from __future__ import annotations
@@ -36,11 +41,13 @@ class WiTAHybridModel(nn.Module):
         → rnn_out               → attn_logits
         ↓                         [B, L, attn_vocab]
     CTCProjection
-        → ctc_logits  [T', B, ctc_vocab]
+        → ctc_log_probs  [B, T', ctc_vocab]
 
-    Parameters
-    ----------
-    cfg : fully built Config (call cfg.build() before passing in)
+    AMP Note
+    --------
+    This module does NOT manage its own autocast context.  Mixed-precision
+    is controlled at the trainer level so that the full forward+loss graph
+    sits inside a single autocast scope — the correct PyTorch AMP pattern.
     """
 
     def __init__(self, cfg: Config):
@@ -51,30 +58,15 @@ class WiTAHybridModel(nn.Module):
         rc = cfg.recurrent
         ac = cfg.attn
 
-        # ------------------------------------------------------------------
-        # Encoder
-        # ------------------------------------------------------------------
         self.encoder: VideoResNet = build_encoder(ec)
-
-        # ------------------------------------------------------------------
-        # Optional recurrent head
-        # ------------------------------------------------------------------
         self.recurrent, rnn_out_dim = build_recurrent_head(ec.out_dim, rc)
-
-        # ------------------------------------------------------------------
-        # CTC projection head
-        # ------------------------------------------------------------------
         self.ctc_proj = CTCProjection(
             d_in=rnn_out_dim,
             num_class=vc.ctc_vocab_size,
             cfg=rc,
         )
-
-        # ------------------------------------------------------------------
-        # Attention decoder
-        # ------------------------------------------------------------------
         self.attn_decoder = AttentionDecoder(
-            encoder_dim=ec.out_dim,    # attn decoder reads raw encoder features
+            encoder_dim=ec.out_dim,
             vocab_cfg=vc,
             attn_cfg=ac,
         )
@@ -84,10 +76,7 @@ class WiTAHybridModel(nn.Module):
     # ------------------------------------------------------------------
 
     def _encode(self, clips: torch.Tensor) -> torch.Tensor:
-        """
-        clips [B, T, C, H, W] → features [B, T', enc_dim]
-        Permutes to [B, C, T, H, W] for the 3-D ResNet.
-        """
+        """clips [B, T, C, H, W] → features [B, T', enc_dim]."""
         return self.encoder(clips.permute(0, 2, 1, 3, 4))
 
     def _ctc_logits(
@@ -95,32 +84,30 @@ class WiTAHybridModel(nn.Module):
         features: torch.Tensor,   # [B, T', enc_dim]
         seq_lens: torch.Tensor,   # [B]
     ) -> torch.Tensor:
-        """
-        features → [T', B, ctc_vocab_size] log-softmax for nn.CTCLoss.
-        """
-        rnn_out = self.recurrent(features, seq_lens)     # [B, T', rnn_out_dim]
-        logits  = self.ctc_proj(rnn_out)                 # [B, T', ctc_vocab]
-        return logits.permute(1, 0, 2).log_softmax(2)   # [T', B, ctc_vocab]
+        """features → [B, T', ctc_vocab_size] log-softmax (batch-first)."""
+        rnn_out = self.recurrent(features, seq_lens)
+        logits  = self.ctc_proj(rnn_out)
+        return logits.log_softmax(2)
 
     # ------------------------------------------------------------------
-    # Forward
+    # Forward  (no autocast here — AMP is owned by the trainer)
     # ------------------------------------------------------------------
 
     def forward(
         self,
-        clips:        torch.Tensor,              # [B, T, C, H, W]
-        seq_lens:     torch.Tensor,              # [B]
-        tgt_tokens:   torch.Tensor | None = None,   # [B, L] with <sos> prepended
-        tgt_pad_mask: torch.Tensor | None = None,   # [B, L] bool
+        clips:        torch.Tensor,
+        seq_lens:     torch.Tensor,
+        tgt_tokens:   torch.Tensor | None = None,
+        tgt_pad_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Returns
         -------
-        ctc_log_probs  : [T', B, ctc_vocab_size]
+        ctc_log_probs  : [B, T', ctc_vocab_size]
         attn_logits    : [B, L, attn_vocab_size]  (None when tgt_tokens is None)
         """
-        features      = self._encode(clips)                        # [B, T', D]
-        ctc_log_probs = self._ctc_logits(features, seq_lens)       # [T', B, V_ctc]
+        features      = self._encode(clips)
+        ctc_log_probs = self._ctc_logits(features, seq_lens)
 
         attn_logits: torch.Tensor | None = None
         if tgt_tokens is not None:
@@ -131,15 +118,14 @@ class WiTAHybridModel(nn.Module):
     @torch.no_grad()
     def decode_ctc_greedy(self, clips: torch.Tensor, seq_lens: torch.Tensor) -> list[list[int]]:
         """Fast greedy CTC decode; returns list of B token-index lists."""
-        features = self._encode(clips)
-        log_probs = self._ctc_logits(features, seq_lens)   # [T, B, V]
-        best = log_probs.argmax(-1).transpose(0, 1)        # [B, T]
-        blank = self.cfg.vocab.blank_idx
-        decoded = []
+        features  = self._encode(clips)
+        log_probs = self._ctc_logits(features, seq_lens)   # [B, T, V]
+        best      = log_probs.argmax(-1)                    # [B, T]
+        blank     = self.cfg.vocab.blank_idx
+        decoded   = []
         for seq in best:
             toks = seq.tolist()
-            collapsed = []
-            prev = None
+            collapsed, prev = [], None
             for t in toks:
                 if t != prev:
                     collapsed.append(t)
@@ -159,5 +145,4 @@ class WiTAHybridModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_model(cfg: Config) -> WiTAHybridModel:
-    """Convenience function. cfg must already be built (cfg.build())."""
     return WiTAHybridModel(cfg)

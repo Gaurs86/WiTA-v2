@@ -10,6 +10,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..configs.default import Config
+
+def _unwrap(m):
+    import torch.nn as nn
+    return m.module if isinstance(m, nn.DataParallel) else m
 from ..datasets.vocab import StrLabelConverter, cer as compute_cer
 from .metrics import decode_ctc_indices, decode_attn_indices
 from ..training.losses import prepare_attn_targets
@@ -59,9 +63,9 @@ def evaluate_cer(
             if decode_mode == "ctc":
                 tgt_in, tgt_out, tgt_pad = prepare_attn_targets(labels, label_lens, vc)
                 ctc_lp, _ = model(clips, input_lens, tgt_in, tgt_pad)
-                pred_seqs  = model.decode_ctc_greedy(clips, input_lens)
+                pred_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)
             else:
-                pred_t    = model.decode_attention(clips, input_lens)
+                pred_t    = _unwrap(model).decode_attention(clips, input_lens)
                 pred_seqs = [pred_t[b].tolist() for b in range(B)]
 
             for b in range(B):
@@ -115,8 +119,8 @@ def print_sample_table(
             label_lens = label_lens.to(device)
             B = clips.shape[0]
 
-            ctc_seqs  = model.decode_ctc_greedy(clips, input_lens)
-            attn_t    = model.decode_attention(clips, input_lens)
+            ctc_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)
+            attn_t    = _unwrap(model).decode_attention(clips, input_lens)
             attn_seqs = [attn_t[b].tolist() for b in range(B)]
 
             for b in range(B):

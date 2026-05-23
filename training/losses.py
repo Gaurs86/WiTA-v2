@@ -93,7 +93,7 @@ def get_lambda_ctc(epoch: int, total_epochs: int, train_cfg: TrainConfig) -> flo
 # ---------------------------------------------------------------------------
 
 def hybrid_loss(
-    ctc_log_probs:  torch.Tensor,    # [T, B, ctc_vocab]
+    ctc_log_probs:  torch.Tensor,    # [B, T, ctc_vocab]  (batch-first from model)
     attn_logits:    torch.Tensor,    # [B, L, attn_vocab]
     targets:        torch.Tensor,    # [B, L_ctc]  1-based char indices
     attn_targets:   torch.Tensor,    # [B, L+1]    with EOS
@@ -109,7 +109,8 @@ def hybrid_loss(
     Returns  (total_loss, ctc_scalar, attn_scalar)
     """
     ctc_loss = _ctc_fn(vocab.blank_idx)(
-        ctc_log_probs, targets, input_lengths, target_lengths
+        ctc_log_probs.permute(1, 0, 2),  # [B, T, V] → [T, B, V] for nn.CTCLoss
+        targets, input_lengths, target_lengths
     )
 
     B, L, V = attn_logits.shape

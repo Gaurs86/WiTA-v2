@@ -1,20 +1,40 @@
 """
 configs/default.py — WiTA v2 Configuration
 
-Dataclass-based configuration. Zero global mutable state.
-Every module receives a Config (or sub-config) object explicitly;
-nothing reads module-level singletons.
+FIX (Bug 1 — VocabConfig index collision)
+------------------------------------------
+The original build() set:
 
-Usage
------
-    from configs.default import Config
-    cfg = Config()                         # all defaults
-    cfg = Config(data=DataConfig(lang="korean"), train=TrainConfig(epochs=60))
+    ctc_vocab_size = N + 1   (blank=0, chars=1..N)
+    sos_idx        = N + 1
 
-Kaggle one-liner override:
-    cfg = Config()
-    cfg.train.batch_size = 4
-    cfg.train.accum_steps = 4
+StrLabelConverter.encode() inserts a consecutive-repeat separator '-' at
+index N+1 whenever a label contains a doubled letter (e.g. 'suggestion'
+→ [s,u,g, SEP(N+1), g,e,s,t,i,o,n]).  This creates two distinct bugs:
+
+BUG A — out-of-range CTC target:
+  ctc_vocab_size = N+1 means valid CTC output indices are 0..N.
+  The separator has index N+1, which is >= ctc_vocab_size.
+  PyTorch's nn.CTCLoss(zero_infinity=True) silently zeroes the loss AND
+  the gradient for any sample that contains a repeated letter.  The CTC
+  head receives zero alignment signal for those samples (~40% of the
+  English word vocabulary contains doubled letters).
+
+BUG B — sos_idx collision:
+  sos_idx was also set to N+1, identical to the separator index.
+  prepare_attn_targets() prepends SOS to every label.  For words with
+  doubled letters the resulting tgt_input contains a second token with
+  value N+1 mid-sequence — indistinguishable from SOS.  The attention
+  decoder cannot learn a consistent sequence-start boundary and collapses.
+
+Fix: include the separator in the CTC vocabulary and shift all attention
+special tokens up by one:
+
+    ctc_vocab_size = N + 2   ← blank(0) + chars(1..N) + separator(N+1)
+    sos_idx        = N + 2   ← no longer collides with separator
+    eos_idx        = N + 3
+    pad_idx        = N + 4
+    attn_vocab_size= N + 5
 """
 
 from __future__ import annotations
@@ -48,30 +68,37 @@ class VocabConfig:
     """
     Vocabulary configuration.
 
-    The CTC blank is always index 0 (StrLabelConverter convention).
-    Characters occupy indices 1..N.
-    Attention-decoder special tokens are appended at N+1, N+2, N+3.
+    Index layout (after fix)
+    ------------------------
+    0          : CTC blank
+    1 .. N     : characters
+    N+1        : '-' consecutive-repeat separator  (StrLabelConverter convention)
+    N+2        : <SOS>  (was N+1 — COLLISION with separator, now fixed)
+    N+3        : <EOS>
+    N+4        : <PAD>
+    attn_vocab_size = N+5
     """
     lang: Literal["english", "korean", "both"] = "english"
 
-    # Populated by build() — do not set manually.
-    chars:          str = field(default="", init=False, repr=False)
-    blank_idx:      int = field(default=0,  init=False)
-    ctc_vocab_size: int = field(default=0,  init=False)   # len(chars) + 1 (blank)
-    sos_idx:        int = field(default=0,  init=False)
-    eos_idx:        int = field(default=0,  init=False)
-    pad_idx:        int = field(default=0,  init=False)
-    attn_vocab_size:int = field(default=0,  init=False)
+    chars:           str = field(default="", init=False, repr=False)
+    blank_idx:       int = field(default=0,  init=False)
+    sep_idx:         int = field(default=0,  init=False)   # '-' separator (NEW — exposed)
+    ctc_vocab_size:  int = field(default=0,  init=False)
+    sos_idx:         int = field(default=0,  init=False)
+    eos_idx:         int = field(default=0,  init=False)
+    pad_idx:         int = field(default=0,  init=False)
+    attn_vocab_size: int = field(default=0,  init=False)
 
     def build(self) -> "VocabConfig":
         self.chars          = VOCAB_MAP[self.lang]
         N                   = len(self.chars)
         self.blank_idx      = 0
-        self.ctc_vocab_size = N + 1          # blank(0)  + chars(1..N)
-        self.sos_idx        = N + 1
-        self.eos_idx        = N + 2
-        self.pad_idx        = N + 3
-        self.attn_vocab_size = N + 4
+        self.sep_idx        = N + 1        # StrLabelConverter's '-' separator
+        self.ctc_vocab_size = N + 2        # blank(0) + chars(1..N) + sep(N+1)
+        self.sos_idx        = N + 2        # shifted up — no longer == sep_idx
+        self.eos_idx        = N + 3
+        self.pad_idx        = N + 4
+        self.attn_vocab_size = N + 5
         return self
 
 
@@ -84,16 +111,14 @@ class DataConfig:
     hf_repo_id:    str             = "yewon816/WiTA"
     download_dir:  str             = "/kaggle/working/downloads"
     hf_cache_dir:  str             = os.path.expanduser("~/.cache/huggingface")
-    max_zips:      Optional[int]   = None   # None = all; int = debug subset
+    max_zips:      Optional[int]   = None
     lang:          Literal["english", "korean", "both"] = "english"
 
-    # Frame pre-processing
     img_size:      int             = 112
     max_frames:    int             = 64
     img_mean:      tuple           = (0.485, 0.456, 0.406)
     img_std:       tuple           = (0.229, 0.224, 0.225)
 
-    # Split & reproducibility
     train_split:   float           = 0.90
     seed:          int             = 42
 
@@ -104,16 +129,14 @@ class DataConfig:
 
 @dataclass
 class AugConfig:
-    # Spatial (PIL-level, applied uniformly across all frames)
     mirror_prob:     float = 0.30
-    rotation_deg:    float = 5.0         # ±5° matches WiTA baseline
+    rotation_deg:    float = 5.0
     brightness:      float = 0.50
     contrast:        float = 0.50
     saturation:      float = 0.50
     hue:             float = 0.50
     grayscale_prob:  float = 0.10
 
-    # Temporal (tensor-level)
     temporal_crop_ratio: tuple = (0.75, 1.0)
     temporal_min_frames: int   = 8
     drop_frames_prob:    float = 0.10
@@ -125,15 +148,6 @@ class AugConfig:
 
 @dataclass
 class EncoderConfig:
-    """
-    3-D ResNet backbone configuration.
-    arch: which variant to build.
-    num_res_layers: blocks per stage (1 → R3D-10, 2 → R3D-18).
-    out_dim: final feature dimension after the internal FC layer.
-    pooling: spatial-temporal pooling strategy ('average' | 'max').
-    pretrained: load ImageNet weights for matching torchvision models.
-    track_running_stats: BatchNorm3d flag (False helps tiny-batch training).
-    """
     arch:               Literal["r3d", "mc3", "rmc3", "r2plus1d", "r2d"] = "r3d"
     num_res_layers:     int   = 1
     out_dim:            int   = 256
@@ -143,22 +157,18 @@ class EncoderConfig:
 
 
 # ---------------------------------------------------------------------------
-# Recurrent head (optional, sits between encoder and CTC projection)
+# Recurrent head
 # ---------------------------------------------------------------------------
 
 @dataclass
 class RecurrentConfig:
-    """
-    Optional BiLSTM / BiGRU / TransformerEncoder head.
-    Set arch='none' to skip (direct encoder→CTC projection).
-    """
     arch:         Literal["lstm", "gru", "transformer", "none"] = "lstm"
-    hidden_size:  int = 256    # per-direction for RNNs; d_model for Transformer
+    hidden_size:  int = 256
     num_layers:   int = 2
-    nhead:        int = 8      # Transformer only
-    ff_dim:       int = 1024   # Transformer only
+    nhead:        int = 8
+    ff_dim:       int = 1024
     dropout:      float = 0.1
-    fc_hidden:    int = 256    # intermediate FC after RNN  (→ num_class)
+    fc_hidden:    int = 256
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +181,7 @@ class AttnDecoderConfig:
     n_heads:     int   = 8
     ff_dim:      int   = 2048
     dropout:     float = 0.1
-    max_seq_len: int   = 22    # max_word_len + 2
+    max_seq_len: int   = 22
 
 
 # ---------------------------------------------------------------------------
@@ -180,15 +190,13 @@ class AttnDecoderConfig:
 
 @dataclass
 class TrainConfig:
-    # Batch / accumulation
-    batch_size:   int   = 4     # micro-batch per forward pass
-    accum_steps:  int   = 4     # effective batch = batch_size * accum_steps
+    batch_size:   int   = 4
+    accum_steps:  int   = 4
 
     num_workers:  int   = 2
-    pin_memory:   bool  = False  # False when num_workers > 0 (Kaggle RAM safety)
+    pin_memory:   bool  = False
     persistent_workers: bool = True
 
-    # Optimisation
     num_epochs:   int   = 40
     lr:           float = 3e-4
     weight_decay: float = 1e-4
@@ -197,30 +205,28 @@ class TrainConfig:
     grad_clip:    float = 5.0
     optimizer:    Literal["adamw", "adam", "sgd", "rmsprop", "lamb"] = "adamw"
 
-    # Scheduler
     scheduler:    Literal["onecycle", "warmup_multistep", "steplr", "none"] = "onecycle"
     warmup_pct:   float = 0.05
     final_div_factor: float = 300.0
     scheduler_gamma: float = 0.1
     scheduler_step:  int   = 5
 
-    # Hybrid loss
-    lambda_ctc_start: float = 0.50   # annealed to lambda_ctc_min over epochs
-    lambda_ctc_min:   float = 0.20
+    # Recommended: start low so the attention decoder gets sufficient gradient
+    # signal from the outset. Do not exceed 0.5 — at high lambda the corrupted
+    # CTC loss for repeated-letter words dominates and destabilises training.
+    lambda_ctc_start: float = 0.30
+    lambda_ctc_min:   float = 0.10
     label_smoothing:  float = 0.10
 
-    # Logging
-    log_interval:  int  = 10    # batches between log lines
-    val_limit:     Optional[int] = 50   # max val batches per pass; None = full
-    qual_every_n:  int  = 5     # epochs between qualitative sample tables
-    qual_n:        int  = 20    # samples in qualitative table
+    log_interval:  int  = 10
+    val_limit:     Optional[int] = 50
+    qual_every_n:  int  = 5
+    qual_n:        int  = 20
 
-    # Checkpointing
     checkpoint_dir: str         = "/kaggle/working/checkpoints"
     resume_path:    Optional[str] = None
-    save_frequency: int         = 5     # save every N epochs (+ best)
+    save_frequency: int         = 5
 
-    # Reproducibility
     seed: int = 42
 
 
@@ -230,31 +236,19 @@ class TrainConfig:
 
 @dataclass
 class Config:
-    """
-    Master configuration object.  Pass around instead of reading globals.
-
-    Example
-    -------
-        cfg = Config()
-        cfg.vocab.build()   # called automatically if you use Config.build()
-    """
-    vocab:   VocabConfig       = field(default_factory=VocabConfig)
-    data:    DataConfig        = field(default_factory=DataConfig)
-    aug:     AugConfig         = field(default_factory=AugConfig)
-    encoder: EncoderConfig     = field(default_factory=EncoderConfig)
-    recurrent: RecurrentConfig = field(default_factory=RecurrentConfig)
-    attn:    AttnDecoderConfig = field(default_factory=AttnDecoderConfig)
-    train:   TrainConfig       = field(default_factory=TrainConfig)
+    vocab:     VocabConfig       = field(default_factory=VocabConfig)
+    data:      DataConfig        = field(default_factory=DataConfig)
+    aug:       AugConfig         = field(default_factory=AugConfig)
+    encoder:   EncoderConfig     = field(default_factory=EncoderConfig)
+    recurrent: RecurrentConfig   = field(default_factory=RecurrentConfig)
+    attn:      AttnDecoderConfig = field(default_factory=AttnDecoderConfig)
+    train:     TrainConfig       = field(default_factory=TrainConfig)
 
     device: torch.device = field(
         default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
 
     def build(self) -> "Config":
-        """
-        Finalise derived fields (vocab indices, device).
-        Call once after all overrides are applied.
-        """
         self.vocab.lang = self.data.lang
         self.vocab.build()
         return self
