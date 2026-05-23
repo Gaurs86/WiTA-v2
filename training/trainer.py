@@ -122,7 +122,14 @@ def train(
                     torch.cuda.device_count())
         model = nn.DataParallel(model)
 
-    total_steps = cfg.train.num_epochs * max(1, len(train_loader) // cfg.train.accum_steps)
+    # Exact steps per epoch = full accumulation boundaries + 1 if there is a
+    # partial remainder batch.  This must match _train_epoch's scheduler.step()
+    # call count exactly — OneCycleLR raises ValueError if over-stepped.
+    _n         = len(train_loader)
+    _full      = _n // cfg.train.accum_steps
+    _remainder = int(_n % cfg.train.accum_steps != 0)
+    steps_per_epoch = max(1, _full + _remainder)
+    total_steps     = cfg.train.num_epochs * steps_per_epoch
     optimizer   = build_optimizer(model.parameters(), cfg.train)
     scheduler   = build_scheduler(optimizer, total_steps, cfg.train)
     scaler      = GradScaler(device=_amp_device, enabled=_use_amp)
