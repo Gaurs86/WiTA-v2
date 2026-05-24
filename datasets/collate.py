@@ -155,7 +155,7 @@ def make_pad_collate(
         # via ignore_index=pad_idx.
         labels_pad = pad_sequence(labels, batch_first=True, padding_value=pad_idx)
 
-        input_lens = torch.LongTensor([seq_len_fn(c.shape[0]) for c in clips])
+        input_lens = torch.LongTensor([c.shape[0] for c in clips])
         label_lens = torch.LongTensor([l.shape[0]             for l in labels])
 
         return clips_pad, labels_pad, input_lens, label_lens
