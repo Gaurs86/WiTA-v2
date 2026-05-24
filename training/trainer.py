@@ -70,10 +70,10 @@ def _train_epoch(
         # autocast wrapper has been removed (see hybrid_model.py) so that
         # all fp16 operations live inside this single scope.
         with autocast(device_type=_amp_device, enabled=_use_amp):
-            ctc_lp, attn_logits = model(clips, input_lens, tgt_in, tgt_pad)
+            ctc_lp, attn_logits, enc_lens = model(clips, input_lens, tgt_in, tgt_pad)
             loss, ctc_v, attn_v = hybrid_loss(
                 ctc_lp, attn_logits, labels, tgt_out,
-                input_lens, label_lens, lambda_ctc, cfg.vocab, cfg.train,
+                enc_lens, label_lens, lambda_ctc, cfg.vocab, cfg.train,
             )
 
         loss = loss / cfg.train.accum_steps
