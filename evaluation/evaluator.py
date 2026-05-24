@@ -62,7 +62,7 @@ def evaluate_cer(
 
             if decode_mode == "ctc":
                 tgt_in, tgt_out, tgt_pad = prepare_attn_targets(labels, label_lens, vc)
-                ctc_lp, _ = model(clips, input_lens, tgt_in, tgt_pad)
+                ctc_lp, _, _ = model(clips, input_lens, tgt_in, tgt_pad)
                 pred_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)
             else:
                 pred_t    = _unwrap(model).decode_attention(clips, input_lens)
