@@ -44,7 +44,7 @@ class BiRNNHead(nn.Module):
     def forward(self, x: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
         packed     = pack_padded_sequence(x, seq_lens.cpu(), batch_first=True, enforce_sorted=False)
         out, _     = self.rnn(packed)
-        out, _     = pad_packed_sequence(out, batch_first=True)
+        out, _     = pad_packed_sequence(out, batch_first=True, total_length=x.size(1))
         return out   # [B, T, 2*hidden_size]
 
 
