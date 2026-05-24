@@ -1,18 +1,53 @@
 """
 models/hybrid_model.py — WiTAHybridModel.
 
-FIX (Bug 3 — AMP double-wrapping)
------------------------------------
-The original forward() wrapped its own body in torch.autocast().  The trainer
-also wrapped the loss computation in a second autocast scope.  This caused the
-model's fp16 activations to exit one autocast context and re-enter another,
-breaking the intended single-scope AMP flow and creating subtle precision
-inconsistencies near the CTC log-softmax boundary.
+FIX (Bug 3 — AMP double-wrapping): see previous note.
 
-Fix: torch.autocast() has been removed from model.forward().  AMP is now
-managed exclusively by the trainer (which wraps both the model forward pass
-AND the loss computation in a single `with autocast(...)` block).  This is
-the standard PyTorch AMP pattern and the correct approach for DataParallel.
+FIX (Bug 4 — Architectural gradient isolation): CRITICAL NEW FIX
+-----------------------------------------------------------------
+Root cause identified from the epoch-1..40 log:
+
+The original forward() was:
+    features = self._encode(clips)             # [B, T', 256]
+    ctc_log_probs = ctc_proj(LSTM(features))   # CTC reads from LSTM output
+    attn_logits = attn_decoder(features, ...)  # Attn reads RAW encoder features!
+
+This creates a gradient isolation trap:
+  • CTCLoss gradient flows:  CTC → ctc_proj → BiLSTM → encoder
+  • CE-loss gradient flows:  CE → attn_decoder → encoder   (bypasses LSTM entirely)
+
+When CTC blank-collapses (which it does by epoch 8–10), the BiLSTM receives
+≈ zero CTC gradient.  The encoder is then optimised solely by the attention
+decoder — but the attention decoder reads raw 256-dim CNN features with no
+temporal context from the LSTM.  The result is the attention decoder learning
+English character n-gram statistics from CNN features (explaining the "English-
+looking-but-wrong" predictions: "coreine", "atenenen", "carenenen"), while the
+LSTM/CTC path stays permanently dead.
+
+Fix: route the attention decoder through the LSTM output (via a lightweight
+linear projection back to 256-dim), so the attention decoder's gradient
+keeps the LSTM alive even when CTC is in blank mode.
+
+Also: initialise the CTC blank-class bias to -3.0 so the blank is harder to
+predict initially, which delays and sometimes prevents blank collapse entirely.
+
+New data flow:
+    encoder  [B, T', 256]
+         |
+    BiLSTM  [B, T', 512]
+         |─────────────────────── rnn_proj Linear(512→256)
+         |                               |
+    ctc_proj [B, T', 28]         attn_decoder (d_model=256, unchanged)
+         |                               |
+    CTCLoss                          CE Loss
+
+Both branches now share the LSTM, so both contribute gradients to it.
+
+AMP Note
+--------
+This module does NOT manage its own autocast context.  Mixed-precision
+is controlled at the trainer level (one unified scope covering both the
+model forward and the loss computation).
 """
 
 from __future__ import annotations
@@ -30,24 +65,20 @@ class WiTAHybridModel(nn.Module):
     """
     End-to-end trainable hybrid CTC + Attention model.
 
-    Architecture
-    ------------
+    Architecture (after Bug 4 fix)
+    --------------------------------
     clips [B, T, C, H, W]
         ↓
     VideoResNet encoder
-        → features  [B, T', enc_dim]
+        → enc_features  [B, T', enc_dim=256]
+        ↓
+    BiLSTM RecurrentHead
+        → rnn_out  [B, T', rnn_dim=512]
         ↓                    ↓
-    RecurrentHead          AttentionDecoder
-        → rnn_out               → attn_logits
-        ↓                         [B, L, attn_vocab]
-    CTCProjection
-        → ctc_log_probs  [B, T', ctc_vocab]
-
-    AMP Note
-    --------
-    This module does NOT manage its own autocast context.  Mixed-precision
-    is controlled at the trainer level so that the full forward+loss graph
-    sits inside a single autocast scope — the correct PyTorch AMP pattern.
+    CTCProjection        rnn_proj  Linear(512→256)
+        → ctc_log_probs      ↓
+          [B, T', 28]   AttentionDecoder
+                             → attn_logits [B, L, attn_vocab=31]
     """
 
     def __init__(self, cfg: Config):
@@ -60,34 +91,49 @@ class WiTAHybridModel(nn.Module):
 
         self.encoder: VideoResNet = build_encoder(ec)
         self.recurrent, rnn_out_dim = build_recurrent_head(ec.out_dim, rc)
+
         self.ctc_proj = CTCProjection(
             d_in=rnn_out_dim,
             num_class=vc.ctc_vocab_size,
             cfg=rc,
         )
+
+        # Projection from LSTM output space back to encoder_dim for the
+        # attention decoder.  If rnn_out_dim == ec.out_dim, this is an
+        # identity (no extra parameters).
+        if rnn_out_dim != ec.out_dim:
+            self.rnn_proj: nn.Module = nn.Sequential(
+                nn.Linear(rnn_out_dim, ec.out_dim),
+                nn.LayerNorm(ec.out_dim),
+            )
+        else:
+            self.rnn_proj = nn.Identity()
+
         self.attn_decoder = AttentionDecoder(
-            encoder_dim=ec.out_dim,
+            encoder_dim=ec.out_dim,   # unchanged — always 256
             vocab_cfg=vc,
             attn_cfg=ac,
         )
+
+        # ── Blank-bias initialisation ──────────────────────────────────────
+        # Initialise the CTC output layer's blank-class bias to a low value
+        # so the model does not trivially collapse to predicting blank for
+        # every frame during early training.
+        self._init_blank_bias(vc.blank_idx)
+
+    def _init_blank_bias(self, blank_idx: int) -> None:
+        """Set CTC blank-class output bias to -3.0 at init time."""
+        last_fc = self.ctc_proj.fc2          # always exists; see CTCProjection
+        with torch.no_grad():
+            last_fc.bias.data[blank_idx] = -3.0
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _encode(self, clips: torch.Tensor) -> torch.Tensor:
-        """clips [B, T, C, H, W] → features [B, T', enc_dim]."""
+        """clips [B, T, C, H, W] → enc_features [B, T', enc_dim]."""
         return self.encoder(clips.permute(0, 2, 1, 3, 4))
-
-    def _ctc_logits(
-        self,
-        features: torch.Tensor,   # [B, T', enc_dim]
-        seq_lens: torch.Tensor,   # [B]
-    ) -> torch.Tensor:
-        """features → [B, T', ctc_vocab_size] log-softmax (batch-first)."""
-        rnn_out = self.recurrent(features, seq_lens)
-        logits  = self.ctc_proj(rnn_out)
-        return logits.log_softmax(2)
 
     # ------------------------------------------------------------------
     # Forward  (no autocast here — AMP is owned by the trainer)
@@ -106,23 +152,39 @@ class WiTAHybridModel(nn.Module):
         ctc_log_probs  : [B, T', ctc_vocab_size]
         attn_logits    : [B, L, attn_vocab_size]  (None when tgt_tokens is None)
         """
-        features      = self._encode(clips)
-        ctc_log_probs = self._ctc_logits(features, seq_lens)
+        enc_features = self._encode(clips)                    # [B, T', 256]
+        rnn_out      = self.recurrent(enc_features, seq_lens) # [B, T', 512]
 
+        # CTC branch: from LSTM output (preserves temporal alignment)
+        ctc_log_probs = self.ctc_proj(rnn_out).log_softmax(2) # [B, T', 28]
+
+        # Attention branch: project LSTM output back to 256-dim so the
+        # attention decoder uses the same dimensionality as before, but
+        # now receives gradients through the LSTM.
         attn_logits: torch.Tensor | None = None
         if tgt_tokens is not None:
-            attn_logits = self.attn_decoder(features, tgt_tokens, tgt_pad_mask)
+            attn_features = self.rnn_proj(rnn_out)             # [B, T', 256]
+            attn_logits   = self.attn_decoder(
+                attn_features, tgt_tokens, tgt_pad_mask
+            )
 
         return ctc_log_probs, attn_logits
 
+    # ------------------------------------------------------------------
+    # Inference helpers
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
-    def decode_ctc_greedy(self, clips: torch.Tensor, seq_lens: torch.Tensor) -> list[list[int]]:
-        """Fast greedy CTC decode; returns list of B token-index lists."""
-        features  = self._encode(clips)
-        log_probs = self._ctc_logits(features, seq_lens)   # [B, T, V]
-        best      = log_probs.argmax(-1)                    # [B, T]
-        blank     = self.cfg.vocab.blank_idx
-        decoded   = []
+    def decode_ctc_greedy(
+        self, clips: torch.Tensor, seq_lens: torch.Tensor
+    ) -> list[list[int]]:
+        """Greedy CTC decode; returns list of B token-index lists."""
+        enc  = self._encode(clips)
+        rnn  = self.recurrent(enc, seq_lens)
+        lp   = self.ctc_proj(rnn).log_softmax(2)   # [B, T, V]
+        best = lp.argmax(-1)                        # [B, T]
+        blank = self.cfg.vocab.blank_idx
+        decoded = []
         for seq in best:
             toks = seq.tolist()
             collapsed, prev = [], None
@@ -134,10 +196,14 @@ class WiTAHybridModel(nn.Module):
         return decoded
 
     @torch.no_grad()
-    def decode_attention(self, clips: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+    def decode_attention(
+        self, clips: torch.Tensor, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
         """Greedy attention decode; returns [B, L] token indices."""
-        features = self._encode(clips)
-        return self.attn_decoder.forward_inference(features)
+        enc  = self._encode(clips)
+        rnn  = self.recurrent(enc, seq_lens)
+        feat = self.rnn_proj(rnn)
+        return self.attn_decoder.forward_inference(feat)
 
 
 # ---------------------------------------------------------------------------

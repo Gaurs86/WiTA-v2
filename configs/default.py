@@ -214,7 +214,7 @@ class TrainConfig:
     # Recommended: start low so the attention decoder gets sufficient gradient
     # signal from the outset. Do not exceed 0.5 — at high lambda the corrupted
     # CTC loss for repeated-letter words dominates and destabilises training.
-    lambda_ctc_start: float = 0.30
+    lambda_ctc_start: float = 0.20   # keep low: high λ amplifies blank-collapse damage
     lambda_ctc_min:   float = 0.10
     label_smoothing:  float = 0.10
 
