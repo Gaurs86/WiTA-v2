@@ -15,8 +15,7 @@ def _unwrap(m):
     import torch.nn as nn
     return m.module if isinstance(m, nn.DataParallel) else m
 from ..datasets.vocab import StrLabelConverter, cer as compute_cer
-from .metrics import decode_ctc_indices, decode_attn_indices
-from ..training.losses import prepare_attn_targets
+from .metrics import decode_ctc_indices
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,6 @@ def evaluate_cer(
     dataloader:   DataLoader,
     converter:    StrLabelConverter,
     cfg:          Config,
-    decode_mode:  Literal["ctc", "attn"] = "ctc",
     max_batches:  int | None = None,
 ) -> tuple[float, list[tuple[str, str]]]:
     """
@@ -60,24 +58,17 @@ def evaluate_cer(
             label_lens = label_lens.to(device)
             B          = clips.shape[0]
 
-            if decode_mode == "ctc":
-                tgt_in, tgt_out, tgt_pad = prepare_attn_targets(labels, label_lens, vc)
-                ctc_lp, _, _ = model(clips, input_lens, tgt_in, tgt_pad)
-                pred_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)
-            else:
-                pred_t    = _unwrap(model).decode_attention(clips, input_lens)
-                pred_seqs = [pred_t[b].tolist() for b in range(B)]
+            pred_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)
+            
 
             for b in range(B):
                 gt_str = converter.decode(
                     labels[b, :label_lens[b].item()].int(),
                     torch.IntTensor([label_lens[b].item()]),
                 )
-                if decode_mode == "ctc":
-                    pred_str = decode_ctc_indices(pred_seqs[b], converter)
-                else:
-                    pred_str = decode_attn_indices(
-                        pred_seqs[b], converter, vc.sos_idx, vc.eos_idx, vc.pad_idx)
+                
+                pred_str = decode_ctc_indices(pred_seqs[b], converter)
+                
 
                 err, length = compute_cer(gt_str, pred_str)
                 err = min(err, length)
@@ -97,7 +88,7 @@ def print_sample_table(
     epoch:       int | None = None,
     max_batches: int | None = None,
 ) -> None:
-    """Print GT vs CTC vs Attn predictions for random validation samples."""
+    """Print GT vs CTC for random validation samples."""
     if max_batches is None:
         max_batches = cfg.train.val_limit
 
@@ -106,7 +97,7 @@ def print_sample_table(
     n_samples = cfg.train.qual_n
     model.eval()
 
-    all_gt, all_ctc, all_attn = [], [], []
+    all_gt, all_ctc = [], []
 
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
@@ -120,8 +111,6 @@ def print_sample_table(
             B = clips.shape[0]
 
             ctc_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)
-            attn_t    = _unwrap(model).decode_attention(clips, input_lens)
-            attn_seqs = [attn_t[b].tolist() for b in range(B)]
 
             for b in range(B):
                 gt = converter.decode(
@@ -130,8 +119,7 @@ def print_sample_table(
                 )
                 all_gt.append(gt)
                 all_ctc.append(decode_ctc_indices(ctc_seqs[b], converter))
-                all_attn.append(decode_attn_indices(
-                    attn_seqs[b], converter, vc.sos_idx, vc.eos_idx, vc.pad_idx))
+                
 
     n    = min(n_samples, len(all_gt))
     idxs = random.sample(range(len(all_gt)), n) if len(all_gt) >= n else list(range(len(all_gt)))
@@ -140,17 +128,15 @@ def print_sample_table(
     hdr = f"\n{'═'*W}\n  Qualitative samples"
     if epoch: hdr += f" — epoch {epoch}"
     hdr += f"\n{'═'*W}"
-    fmt = "{:<18} {:<18} {:<18} {:>8} {:>9}"
-    rows = [hdr, fmt.format("Ground Truth", "CTC Pred", "Attn Pred", "CTC CER", "Attn CER"), "─"*W]
+    fmt = "{:<24} {:<24} {:>8}"
+    rows = [hdr, fmt.format("Ground Truth", "CTC Pred", "CTC CER"), "─"*W]
 
     for i in idxs:
-        gt, ctc, attn = all_gt[i], all_ctc[i], all_attn[i]
+        gt, ctc= all_gt[i], all_ctc[i]
         c_err, c_len  = compute_cer(gt, ctc)
-        a_err, a_len  = compute_cer(gt, attn)
         rows.append(fmt.format(
-            gt[:18], ctc[:18], attn[:18],
+            gt[:24], ctc[:24],
             f"{c_err/max(c_len,1):.3f}",
-            f"{a_err/max(a_len,1):.3f}",
         ))
 
     rows.append("═" * W)
