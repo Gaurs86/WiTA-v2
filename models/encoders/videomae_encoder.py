@@ -116,6 +116,17 @@ class VideoMAEEncoder(nn.Module):
         self.n_spatial   = n_h * n_h                               # spatial patches per tube
         self.n_patches   = self.T_prime * self.n_spatial           # total patches
 
+        # ── Positional embedding interpolation ───────────────────────────────
+        # VideoMAE-base was pretrained on 16 frames → 1568 pos embeddings
+        # (T'_pretrain=8, n_spatial=196).  Any other num_frames requires the
+        # temporal dimension of the position embedding table to be resized.
+        # Without this, forward() crashes with a tensor-size mismatch.
+        pretrain_frames = self.backbone.config.num_frames          # typically 16
+        if self.num_frames != pretrain_frames:
+            self._interpolate_pos_embed(pretrain_frames)
+            # Patch the config so HF's internal shape-checks also pass
+            self.backbone.config.num_frames = self.num_frames
+
         print(
             f"[VideoMAEEncoder] num_frames={self.num_frames}, "
             f"T'={self.T_prime}, n_spatial={self.n_spatial}, "
@@ -138,6 +149,79 @@ class VideoMAEEncoder(nn.Module):
             self.proj = nn.Identity()
 
         self.out_dim = cfg.out_dim
+
+    # ------------------------------------------------------------------
+    # Positional embedding interpolation
+    # ------------------------------------------------------------------
+
+    def _interpolate_pos_embed(self, pretrain_frames: int) -> None:
+        """
+        Resize the backbone's temporal positional embeddings so they match
+        self.num_frames, enabling fine-tuning at a different frame count
+        than what the model was pretrained on.
+
+        Layout of VideoMAE position embeddings
+        ----------------------------------------
+        pos_embed : [1, T'_pretrain * n_spatial, hidden_size]
+        e.g. pretrained 16 fr → [1, 1568, 768]  (T'=8, n_spatial=196)
+
+        Strategy
+        ---------
+        1. Reshape to [1, T'_pretrain, n_spatial, hidden_size]
+        2. Permute  to [1, hidden_size, T'_pretrain, n_spatial]
+        3. F.interpolate (bilinear) along dim-2 to T'_new
+        4. Permute back and flatten → [1, T'_new * n_spatial, hidden_size]
+        5. Replace as nn.Parameter (frozen/trainable matches backbone state)
+
+        This is identical to the interpolation used in the official VideoMAE
+        fine-tuning scripts (util/pos_embed.py → interpolate_pos_embed).
+        """
+        T_prime_old = pretrain_frames // self.tubelet_size   # e.g. 8
+        T_prime_new = self.T_prime                           # e.g. 16 for 32 frames
+
+        if T_prime_old == T_prime_new:
+            return   # nothing to do
+
+        pe_old = self.backbone.embeddings.position_embeddings.data
+        # pe_old : [1, T'_old * n_spatial, D]
+        D = pe_old.shape[-1]
+
+        # Reshape → [1, D, T'_old, n_spatial] for interpolation
+        pe = (
+            pe_old
+            .reshape(1, T_prime_old, self.n_spatial, D)   # [1, T'_old, S, D]
+            .permute(0, 3, 1, 2)                           # [1, D, T'_old, S]
+            .float()
+        )
+
+        # Interpolate temporal dimension only
+        pe_new = F.interpolate(
+            pe,
+            size=(T_prime_new, self.n_spatial),
+            mode="bilinear",
+            align_corners=False,
+        )                                                  # [1, D, T'_new, S]
+
+        # Back to [1, T'_new * n_spatial, D]
+        pe_new = (
+            pe_new
+            .permute(0, 2, 3, 1)                          # [1, T'_new, S, D]
+            .reshape(1, T_prime_new * self.n_spatial, D)  # [1, T'_new*S, D]
+            .to(dtype=self.backbone.embeddings.position_embeddings.dtype)
+        )
+
+        # Replace as a parameter; requires_grad matches whatever freeze_backbone set
+        self.backbone.embeddings.position_embeddings = nn.Parameter(
+            pe_new,
+            requires_grad=self.backbone.embeddings.position_embeddings.requires_grad,
+        )
+
+        print(
+            f"[VideoMAEEncoder] Positional embeddings interpolated: "
+            f"T'={T_prime_old} ({pretrain_frames} frames) → "
+            f"T'={T_prime_new} ({self.num_frames} frames)  "
+            f"shape: {list(pe_old.shape)} → {list(pe_new.shape)}"
+        )
 
     # ------------------------------------------------------------------
     # Preprocessing helpers
