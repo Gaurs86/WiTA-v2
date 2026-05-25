@@ -1,134 +1,150 @@
 """
-models/hybrid_model.py — WiTAHybridModel.
+models/hybrid_model.py — WiTACTCModel (VideoMAE / Video Swin + CTC).
 
-FIX SUMMARY (this revision):
-------------------------------
-Bug A — blank bias direction (CRITICAL)
-    Previous: blank_bias = −3.0 → P(blank) ≈ 0.0018 at init.
-    Words with repeated characters (needed, common, letter, etc.) require at
-    least one blank between identical adjacent chars.  With P(blank)≈0, those
-    samples produce loss=∞ → zero_infinity fires → gradient=0.  CTC never
-    learns because it can never produce valid alignments for a large fraction
-    of the vocabulary.
+Refactored from WiTAHybridModel (R3D + BiLSTM + Hybrid CTC/Attention)
+to a clean CTC-only architecture with a pretrained VideoMAE backbone.
 
-    Fix: blank_bias = +log(p_blank*(V−1)/(1−p_blank)) ≈ +4.1 for p_blank=0.7,
-    giving P(blank)≈0.70 — matching the natural proportion (T−L)/T = (16−5)/16.
+Architecture
+------------
+clips [B, T, C, H, W]
+    ↓
+VideoMAEEncoder (or VideoSwinEncoder / VideoResNet fallback)
+    → enc_features  [B, T', enc_dim]       T'=8 for VideoMAE-base/16fr
+    ↓
+BiLSTM RecurrentHead  (or "none" for pure linear)
+    → rnn_out       [B, T', rnn_dim]
+    ↓
+CTCProjection  Linear(rnn_dim → vocab)
+    → ctc_logits    [B, T', ctc_vocab_size]
+    ↓
+log_softmax(-1)
+    → ctc_log_probs [B, T', V]             → permute → [T', B, V] for CTCLoss
 
-Bug B — lambda_ctc = 0.1 (CRITICAL)
-    Not fixed here — it is a config value (TrainConfig.lambda_ctc_start).
-    Change lambda_ctc_start from 0.1 → 0.75 and lambda_ctc_min from ~0 → 0.3.
-    See losses.py and training config.
+Removed from hybrid version
+----------------------------
+• AttentionDecoder  (attention branch)
+• rnn_proj / attn_features routing
+• All attention-decoder imports
+• No tgt_tokens / tgt_pad_mask in forward()
+• No hybrid loss — forward() returns (ctc_log_probs, enc_lens) only
 
-Bug C — seq_lens not scaled by temporal stride (HIGH)
-    Previous: raw frame counts from the dataloader were passed directly into
-    both pack_padded_sequence and CTCLoss.  If the dataset computes encoded
-    lengths correctly this happens not to crash, but:
-      • For non-multiples of 4 the integer arithmetic differs from actual
-        encoder convolution output (e.g. raw=63 → dataset gives 63//4=15 but
-        encoder actually outputs T'=16).
-      • The inference decode paths (decode_ctc_greedy, decode_attention) had
-        no length scaling at all.
+Kept / fixed
+------------
+• _init_blank_bias()   — p_blank=0.70 positive bias (Bug A fix preserved)
+• _compute_enc_lens()  — ratio-based scaling (Bug C fix preserved)
+• AMP-compatible (no internal autocast; trainer owns the scope)
+• CTCProjection now uses GELU instead of ReLU (Bug D fix)
+• WiTAHybridModel alias for backward compatibility
 
-    Fix: _compute_enc_lens() derives enc_lens from the actual T_enc/T_raw ratio
-    inside the model, making it architecture-agnostic and robust to rounding.
-    forward() returns enc_lens so the trainer passes it correctly to CTCLoss.
-
-Bug D — ReLU in CTCProjection (MEDIUM)
-    fc1 → ReLU → fc2 can produce dead neurons when CTC gradients are weak.
-    Changed to GELU (non-zero gradient everywhere, empirically better for
-    sequence-to-sequence projection heads).
+Debug prints (disable by setting WiTA_DEBUG=0)
+----------------------------------------------
+Printed to stdout during forward pass:
+  [DEBUG WiTACTCModel] input clip shape: ...
+  [DEBUG WiTACTCModel] encoder output shape: ...
+  [DEBUG WiTACTCModel] T_raw=..., T_enc=...
+  [DEBUG WiTACTCModel] CTC logits shape: ...
 """
 
 from __future__ import annotations
 import math
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ..configs.default import Config
-from .encoders.resnet3d import VideoResNet, build_encoder
+from ..configs.default import Config, EncoderConfig
 from .modules.recurrent import build_recurrent_head, CTCProjection
-from .decoders.attention import AttentionDecoder
+
+# Debug flag — set env var WiTA_DEBUG=0 to silence
+_DEBUG = os.environ.get("WiTA_DEBUG", "1") != "0"
 
 
-class WiTAHybridModel(nn.Module):
+def _dbg(msg: str) -> None:
+    if _DEBUG:
+        print(msg)
+
+
+# ---------------------------------------------------------------------------
+# Encoder dispatch
+# ---------------------------------------------------------------------------
+
+def _build_encoder(ec: EncoderConfig) -> nn.Module:
     """
-    End-to-end trainable hybrid CTC + Attention model.
+    Build the visual backbone based on ec.arch.
 
-    Architecture
-    --------------------------------
-    clips [B, T, C, H, W]
-        ↓
-    VideoResNet encoder
-        → enc_features  [B, T', enc_dim=256]
-        ↓
-    BiLSTM RecurrentHead
-        → rnn_out  [B, T', rnn_dim=512]
-        ↓                    ↓
-    CTCProjection        rnn_proj  Linear(512→256)
-        → ctc_log_probs      ↓
-          [B, T', 28]   AttentionDecoder
-                             → attn_logits [B, L, attn_vocab=31]
+    VideoMAE / Video Swin  →  models/encoders/videomae_encoder.py
+    R3D / MC3 / R2+1D      →  models/encoders/resnet3d.py  (unchanged)
+    """
+    arch = ec.arch.lower()
+    if arch in ("videomae", "video_swin"):
+        from .encoders.videomae_encoder import build_video_encoder
+        return build_video_encoder(ec)
+    else:
+        from .encoders.resnet3d import build_encoder as build_r3d
+        return build_r3d(ec)
 
-    forward() now returns (ctc_log_probs, attn_logits, enc_lens) where
-    enc_lens [B] are the correctly-scaled encoded sequence lengths that
-    the trainer must pass to CTCLoss as input_lengths.
+
+# ---------------------------------------------------------------------------
+# WiTACTCModel
+# ---------------------------------------------------------------------------
+
+class WiTACTCModel(nn.Module):
+    """
+    End-to-end trainable CTC model with VideoMAE (or R3D) backbone.
+
+    forward() signature is compatible with the hybrid model's forward()
+    (extra tgt_tokens / tgt_pad_mask args are accepted but silently ignored)
+    so existing trainer / evaluator code works without changes to call sites.
+
+    Returns
+    -------
+    ctc_log_probs : [B, T', ctc_vocab_size]  — log-softmax probabilities
+    enc_lens      : [B]  — encoded sequence lengths (for CTCLoss input_lengths)
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config) -> None:
         super().__init__()
         self.cfg = cfg
         vc = cfg.vocab
         ec = cfg.encoder
         rc = cfg.recurrent
-        ac = cfg.attn
 
-        self.encoder: VideoResNet = build_encoder(ec)
-        self.recurrent, rnn_out_dim = build_recurrent_head(ec.out_dim, rc)
+        # ── Visual backbone ──────────────────────────────────────────────
+        self.encoder: nn.Module = _build_encoder(ec)
+        encoder_dim: int        = ec.out_dim          # projection output dim
 
+        # ── Optional recurrent head ──────────────────────────────────────
+        self.recurrent, rnn_out_dim = build_recurrent_head(encoder_dim, rc)
+
+        # ── CTC projection head ──────────────────────────────────────────
         self.ctc_proj = CTCProjection(
             d_in=rnn_out_dim,
             num_class=vc.ctc_vocab_size,
             cfg=rc,
         )
 
-        if rnn_out_dim != ec.out_dim:
-            self.rnn_proj: nn.Module = nn.Sequential(
-                nn.Linear(rnn_out_dim, ec.out_dim),
-                nn.LayerNorm(ec.out_dim),
-            )
-        else:
-            self.rnn_proj = nn.Identity()
-
-        self.attn_decoder = AttentionDecoder(
-            encoder_dim=ec.out_dim,
-            vocab_cfg=vc,
-            attn_cfg=ac,
-        )
-
+        # ── Blank bias initialisation ────────────────────────────────────
+        # Sets P(blank) ≈ 0.70 at init so repeated-character words can be
+        # aligned by CTC from the first step (Bug A fix — kept from hybrid).
         self._init_blank_bias(vc.blank_idx, p_blank=0.70)
 
+        print(
+            f"[WiTACTCModel] encoder_dim={encoder_dim}, "
+            f"rnn_out_dim={rnn_out_dim}, "
+            f"ctc_vocab_size={vc.ctc_vocab_size}"
+        )
+
     # ------------------------------------------------------------------
-    # Blank bias — FIXED direction
+    # Blank bias  (Bug A fix preserved from hybrid model)
     # ------------------------------------------------------------------
 
     def _init_blank_bias(self, blank_idx: int, p_blank: float = 0.70) -> None:
         """
-        Initialise the CTC blank bias so P(blank) ≈ p_blank at model init.
+        Initialise the CTC projection's blank logit so P(blank) ≈ p_blank.
 
-        Target p_blank ≈ 0.65–0.75, matching the natural proportion of blank
-        frames in a CTC alignment: (T − L) / T = (16 − 5) / 16 ≈ 0.69.
+        Formula (softmax inverse, all other logits ≈ 0 at init):
+            b = log(p_blank * (V-1) / (1 - p_blank))
 
-        Formula (softmax inverse):
-            P(blank) = exp(b) / (exp(b) + (V−1)·1)    [other logits ≈ 0]
-            b = log(p_blank · (V−1) / (1 − p_blank))
-
-        For V=28, p_blank=0.70:
-            b = log(0.70 · 27 / 0.30) = log(63) ≈ 4.14   ← POSITIVE
-
-        Previous value was −3.0, giving P(blank) ≈ 0.002, which made words
-        with repeated characters unalignable and triggered zero_infinity on
-        the majority of the training set.
+        For V=28, p_blank=0.70: b ≈ +4.14  ← POSITIVE (not -3.0)
         """
         V = self.ctc_proj.fc2.out_features
         b = math.log(p_blank * (V - 1) / (1.0 - p_blank))
@@ -136,7 +152,7 @@ class WiTAHybridModel(nn.Module):
             self.ctc_proj.fc2.bias.data[blank_idx] = b
 
     # ------------------------------------------------------------------
-    # Encoded length computation — FIXED
+    # Encoded length scaling  (Bug C fix preserved from hybrid model)
     # ------------------------------------------------------------------
 
     def _compute_enc_lens(
@@ -146,93 +162,151 @@ class WiTAHybridModel(nn.Module):
         T_raw:    int,
     ) -> torch.Tensor:
         """
-        Scale raw frame counts to encoded sequence lengths.
+        Scale raw frame counts → encoded sequence lengths.
 
-        Uses the actual ratio T_enc / T_raw rather than a hardcoded stride.
-        This is architecture-agnostic and handles integer-rounding edge cases
-        that a simple // 4 misses (e.g. raw=63 → encoder outputs 16, not 15).
+        Uses the actual T_enc/T_raw ratio rather than a hardcoded stride so
+        the computation is architecture-agnostic and handles edge cases.
 
         Returns enc_lens clamped to [1, T_enc].
+
+        VideoMAE note
+        -------------
+        After temporal resampling to 16 frames and tube pooling to T'=8,
+        T_enc=8 for all samples regardless of their original length. The
+        scaling will give:
+            enc_lens[i] = ceil(raw_lens[i] * 8 / T_raw)
+        which correctly reflects that longer clips contribute more content
+        to each temporal slot.
         """
         if T_raw == 0 or T_enc == 0:
             return raw_lens.clamp(min=1, max=max(T_enc, 1))
-        scale = T_enc / T_raw                              # e.g. 16/64 = 0.25
+        scale    = T_enc / T_raw
         enc_lens = (raw_lens.float() * scale).ceil().long()
         return enc_lens.clamp(min=1, max=T_enc)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal encode helper
     # ------------------------------------------------------------------
 
     def _encode(self, clips: torch.Tensor) -> torch.Tensor:
-        """clips [B, T, C, H, W] → enc_features [B, T', enc_dim]."""
-        return self.encoder(clips.permute(0, 2, 1, 3, 4))
+        """
+        clips [B, T, C, H, W] → enc_features [B, T', enc_dim]
+
+        VideoMAE expects [B, T, C, H, W] — no permute needed.
+        R3D expects [B, C, T, H, W] — permuted here.
+        """
+        arch = self.cfg.encoder.arch.lower()
+        if arch in ("videomae", "video_swin"):
+            return self.encoder(clips)                      # already [B,T,C,H,W]
+        else:
+            return self.encoder(clips.permute(0, 2, 1, 3, 4))  # → [B,C,T,H,W]
 
     # ------------------------------------------------------------------
-    # Forward  (no autocast here — AMP is owned by the trainer)
+    # Forward  (no autocast — AMP scope owned by trainer)
     # ------------------------------------------------------------------
 
     def forward(
         self,
         clips:        torch.Tensor,
         seq_lens:     torch.Tensor,
-        tgt_tokens:   torch.Tensor | None = None,
-        tgt_pad_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        tgt_tokens:   torch.Tensor | None = None,   # ignored (compat only)
+        tgt_pad_mask: torch.Tensor | None = None,   # ignored (compat only)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        Parameters
+        ----------
+        clips     : [B, T, C, H, W]
+        seq_lens  : [B]  raw clip lengths in frames
+
         Returns
         -------
         ctc_log_probs : [B, T', ctc_vocab_size]
-        attn_logits   : [B, L, attn_vocab_size]  (None when tgt_tokens is None)
-        enc_lens      : [B]  encoded sequence lengths — pass to CTCLoss as
-                             input_lengths.  DO NOT use the raw seq_lens.
+        enc_lens      : [B]   encoded lengths — pass to CTCLoss as input_lengths
 
-        The trainer must use enc_lens (not raw seq_lens) when calling
-        hybrid_loss().
+        IMPORTANT: always use enc_lens (not raw seq_lens) for CTCLoss.
+
+        Shape walkthrough (VideoMAE-base defaults)
+        ------------------------------------------
+        clips         [B, T,  3, 224, 224]  e.g. T=64
+        enc_features  [B, 8,  768]           T'=8 from VideoMAE+pool
+        rnn_out       [B, 8,  512]           BiLSTM hidden_size=256 × 2
+        ctc_logits    [B, 8,  28]            ctc_vocab_size=28
+        ctc_log_probs [B, 8,  28]
+        → CTCLoss wants [T', B, 28] = permute(1, 0, 2)
         """
-        T_raw        = clips.shape[1]                         # raw temporal dim
-        enc_features = self._encode(clips)                    # [B, T', 256]
+        T_raw = clips.shape[1]
+        _dbg(f"[DEBUG WiTACTCModel] input clip shape:    {list(clips.shape)}")
+
+        # 1. Visual backbone
+        enc_features = self._encode(clips)                  # [B, T', D]
         T_enc        = enc_features.shape[1]
 
-        # --- Scale lengths from raw-frame space to encoded-frame space ---
-        enc_lens = self._compute_enc_lens(seq_lens, T_enc, T_raw)   # [B]
+        _dbg(f"[DEBUG WiTACTCModel] encoder output shape: {list(enc_features.shape)}")
+        _dbg(f"[DEBUG WiTACTCModel] T_raw={T_raw}, T_enc={T_enc}")
 
-        rnn_out = self.recurrent(enc_features, enc_lens)             # [B, T', 512]
+        # 2. Scale raw frame lengths → encoded frame lengths
+        enc_lens = self._compute_enc_lens(seq_lens, T_enc, T_raw)  # [B]
 
-        # CTC branch
-        ctc_log_probs = self.ctc_proj(rnn_out).log_softmax(2)       # [B, T', 28]
+        # 3. Optional recurrent head
+        rnn_out = self.recurrent(enc_features, enc_lens)    # [B, T', rnn_dim]
 
-        # Attention branch
-        attn_logits: torch.Tensor | None = None
-        if tgt_tokens is not None:
-            attn_features = self.rnn_proj(rnn_out)                  # [B, T', 256]
-            attn_logits   = self.attn_decoder(
-                attn_features, tgt_tokens, tgt_pad_mask
-            )
+        # 4. CTC projection + log-softmax
+        ctc_logits    = self.ctc_proj(rnn_out)              # [B, T', V]
+        ctc_log_probs = ctc_logits.log_softmax(-1)          # [B, T', V]
 
-        return ctc_log_probs, attn_logits, enc_lens
+        _dbg(f"[DEBUG WiTACTCModel] CTC logits shape:     {list(ctc_log_probs.shape)}")
+
+        return ctc_log_probs, enc_lens
 
     # ------------------------------------------------------------------
-    # Inference helpers  (also use enc_lens now)
+    # Backbone un-freezing (called by trainer after warm-up epochs)
+    # ------------------------------------------------------------------
+
+    def unfreeze_backbone(self) -> None:
+        """
+        Un-freeze all backbone parameters for end-to-end fine-tuning.
+        Call after the CTC head has warmed up (e.g. epoch 10+).
+        """
+        ec   = self.cfg.encoder
+        arch = ec.arch.lower()
+        if arch in ("videomae", "video_swin"):
+            for p in self.encoder.backbone.parameters():
+                p.requires_grad_(True)
+            print("[WiTACTCModel] Backbone UNFROZEN — full fine-tuning enabled")
+        else:
+            print("[WiTACTCModel] R3D backbone: no freezing was applied; "
+                  "unfreeze_backbone() is a no-op")
+
+    # ------------------------------------------------------------------
+    # Greedy CTC decode (inference)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def decode_ctc_greedy(
-        self, clips: torch.Tensor, seq_lens: torch.Tensor
+        self,
+        clips:    torch.Tensor,
+        seq_lens: torch.Tensor,
     ) -> list[list[int]]:
-        T_raw = clips.shape[1]
-        enc   = self._encode(clips)
-        T_enc = enc.shape[1]
+        """
+        Greedy (argmax) CTC decode.
+
+        Returns list[list[int]] — one decoded token list per batch item,
+        with blank tokens and consecutive duplicates removed.
+        """
+        T_raw    = clips.shape[1]
+        enc      = self._encode(clips)
+        T_enc    = enc.shape[1]
         enc_lens = self._compute_enc_lens(seq_lens, T_enc, T_raw)
 
-        rnn  = self.recurrent(enc, enc_lens)
-        lp   = self.ctc_proj(rnn).log_softmax(2)                    # [B, T, V]
-        best = lp.argmax(-1)                                        # [B, T]
-        blank = self.cfg.vocab.blank_idx
-        decoded = []
+        rnn      = self.recurrent(enc, enc_lens)
+        lp       = self.ctc_proj(rnn).log_softmax(-1)   # [B, T, V]
+        best     = lp.argmax(-1)                         # [B, T]
+        blank    = self.cfg.vocab.blank_idx
+
+        decoded: list[list[int]] = []
         for b_idx, seq in enumerate(best):
             valid_len = int(enc_lens[b_idx].item())
-            toks = seq[:valid_len].tolist()
+            toks      = seq[:valid_len].tolist()
             collapsed, prev = [], None
             for t in toks:
                 if t != prev:
@@ -241,23 +315,47 @@ class WiTAHybridModel(nn.Module):
             decoded.append([t for t in collapsed if t != blank])
         return decoded
 
+    # ------------------------------------------------------------------
+    # Kept for evaluator compat — routes to decode_ctc_greedy
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
     def decode_attention(
-        self, clips: torch.Tensor, seq_lens: torch.Tensor
+        self,
+        clips:    torch.Tensor,
+        seq_lens: torch.Tensor,
     ) -> torch.Tensor:
-        T_raw = clips.shape[1]
-        enc   = self._encode(clips)
-        T_enc = enc.shape[1]
-        enc_lens = self._compute_enc_lens(seq_lens, T_enc, T_raw)
+        """
+        Stub — returns greedy CTC decode as a tensor for evaluator compat.
+        The attention decoder has been removed; this is intentionally a
+        CTC fallback so existing evaluate_cer(decode_mode='attn') calls
+        don't crash.
+        """
+        seqs = self.decode_ctc_greedy(clips, seq_lens)
+        # Pad to same length for tensor conversion
+        if not seqs:
+            return clips.new_zeros(0, 1, dtype=torch.long)
+        max_len = max(len(s) for s in seqs)
+        pad = self.cfg.vocab.pad_idx
+        out = clips.new_full((len(seqs), max(max_len, 1)), pad, dtype=torch.long)
+        for i, s in enumerate(seqs):
+            if s:
+                out[i, :len(s)] = clips.new_tensor(s, dtype=torch.long)
+        return out
 
-        rnn  = self.recurrent(enc, enc_lens)
-        feat = self.rnn_proj(rnn)
-        return self.attn_decoder.forward_inference(feat)
+
+# ---------------------------------------------------------------------------
+# Backward-compat alias
+# ---------------------------------------------------------------------------
+
+#: Old name used by existing checkpoints / scripts — maps to WiTACTCModel.
+WiTAHybridModel = WiTACTCModel
 
 
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def build_model(cfg: Config) -> WiTAHybridModel:
-    return WiTAHybridModel(cfg)
+def build_model(cfg: Config) -> WiTACTCModel:
+    """Construct a WiTACTCModel from a fully-built Config."""
+    return WiTACTCModel(cfg)

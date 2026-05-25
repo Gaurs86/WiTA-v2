@@ -1,40 +1,33 @@
 """
-configs/default.py — WiTA v2 Configuration
+configs/default.py — WiTA v2 Configuration (VideoMAE + CTC refactor)
 
-FIX (Bug 1 — VocabConfig index collision)
-------------------------------------------
-The original build() set:
+Changes from hybrid version
+----------------------------
+EncoderConfig
+  • arch now includes "videomae" and "video_swin" (default: "videomae")
+  • Added: videomae_model_name, videomae_num_frames, tubelet_size,
+           patch_size, freeze_backbone
+  • img_size moved here from DataConfig (VideoMAE needs 224; R3D used 112)
+  • out_dim default changed to 768 (VideoMAE-B hidden size)
 
-    ctc_vocab_size = N + 1   (blank=0, chars=1..N)
-    sos_idx        = N + 1
+TrainConfig
+  • Removed: lambda_ctc_start, lambda_ctc_min, label_smoothing
+             (attention-decoder-only fields)
+  • lr default → 1e-4 (more conservative with large frozen backbone)
+  • batch_size default → 1 (VideoMAE at 224px is VRAM-heavy)
+  • Added: unfreeze_after_epoch — backbone unfreezing schedule
 
-StrLabelConverter.encode() inserts a consecutive-repeat separator '-' at
-index N+1 whenever a label contains a doubled letter (e.g. 'suggestion'
-→ [s,u,g, SEP(N+1), g,e,s,t,i,o,n]).  This creates two distinct bugs:
+AttnDecoderConfig kept for reference but NOT used by WiTACTCModel.
 
-BUG A — out-of-range CTC target:
-  ctc_vocab_size = N+1 means valid CTC output indices are 0..N.
-  The separator has index N+1, which is >= ctc_vocab_size.
-  PyTorch's nn.CTCLoss(zero_infinity=True) silently zeroes the loss AND
-  the gradient for any sample that contains a repeated letter.  The CTC
-  head receives zero alignment signal for those samples (~40% of the
-  English word vocabulary contains doubled letters).
-
-BUG B — sos_idx collision:
-  sos_idx was also set to N+1, identical to the separator index.
-  prepare_attn_targets() prepends SOS to every label.  For words with
-  doubled letters the resulting tgt_input contains a second token with
-  value N+1 mid-sequence — indistinguishable from SOS.  The attention
-  decoder cannot learn a consistent sequence-start boundary and collapses.
-
-Fix: include the separator in the CTC vocabulary and shift all attention
-special tokens up by one:
-
-    ctc_vocab_size = N + 2   ← blank(0) + chars(1..N) + separator(N+1)
-    sos_idx        = N + 2   ← no longer collides with separator
-    eos_idx        = N + 3
-    pad_idx        = N + 4
-    attn_vocab_size= N + 5
+VocabConfig layout (unchanged)
+--------------------------------
+0          : CTC blank
+1 .. N     : characters
+N+1        : '-' consecutive-repeat separator
+N+2        : <SOS>  (attention only — unused in CTC model)
+N+3        : <EOS>
+N+4        : <PAD>
+attn_vocab_size = N+5
 """
 
 from __future__ import annotations
@@ -66,14 +59,14 @@ VOCAB_MAP: dict[str, str] = {
 @dataclass
 class VocabConfig:
     """
-    Vocabulary configuration.
+    Vocabulary configuration.  Layout unchanged from hybrid version.
 
-    Index layout (after fix)
-    ------------------------
+    Index layout
+    ------------
     0          : CTC blank
     1 .. N     : characters
-    N+1        : '-' consecutive-repeat separator  (StrLabelConverter convention)
-    N+2        : <SOS>  (was N+1 — COLLISION with separator, now fixed)
+    N+1        : '-' consecutive-repeat separator  (StrLabelConverter)
+    N+2        : <SOS>   (kept for evaluator/decoder compatibility)
     N+3        : <EOS>
     N+4        : <PAD>
     attn_vocab_size = N+5
@@ -82,7 +75,7 @@ class VocabConfig:
 
     chars:           str = field(default="", init=False, repr=False)
     blank_idx:       int = field(default=0,  init=False)
-    sep_idx:         int = field(default=0,  init=False)   # '-' separator (NEW — exposed)
+    sep_idx:         int = field(default=0,  init=False)
     ctc_vocab_size:  int = field(default=0,  init=False)
     sos_idx:         int = field(default=0,  init=False)
     eos_idx:         int = field(default=0,  init=False)
@@ -90,14 +83,14 @@ class VocabConfig:
     attn_vocab_size: int = field(default=0,  init=False)
 
     def build(self) -> "VocabConfig":
-        self.chars          = VOCAB_MAP[self.lang]
-        N                   = len(self.chars)
-        self.blank_idx      = 0
-        self.sep_idx        = N + 1        # StrLabelConverter's '-' separator
-        self.ctc_vocab_size = N + 2        # blank(0) + chars(1..N) + sep(N+1)
-        self.sos_idx        = N + 2        # shifted up — no longer == sep_idx
-        self.eos_idx        = N + 3
-        self.pad_idx        = N + 4
+        self.chars           = VOCAB_MAP[self.lang]
+        N                    = len(self.chars)
+        self.blank_idx       = 0
+        self.sep_idx         = N + 1
+        self.ctc_vocab_size  = N + 2
+        self.sos_idx         = N + 2
+        self.eos_idx         = N + 3
+        self.pad_idx         = N + 4
         self.attn_vocab_size = N + 5
         return self
 
@@ -114,7 +107,10 @@ class DataConfig:
     max_zips:      Optional[int]   = None
     lang:          Literal["english", "korean", "both"] = "english"
 
-    img_size:      int             = 112
+    # NOTE: VideoMAE requires 224×224. If using R3D encoder, 112 is fine.
+    # img_size is now in EncoderConfig; DataConfig.img_size is the resize
+    # target BEFORE the encoder — set equal to EncoderConfig.img_size.
+    img_size:      int             = 224    # changed from 112 for VideoMAE
     max_frames:    int             = 64
     img_mean:      tuple           = (0.485, 0.456, 0.406)
     img_std:       tuple           = (0.229, 0.224, 0.225)
@@ -137,23 +133,68 @@ class AugConfig:
     hue:             float = 0.50
     grayscale_prob:  float = 0.10
 
-    temporal_crop_ratio: tuple = (0.75, 1.0)
-    temporal_min_frames: int   = 8
-    drop_frames_prob:    float = 0.10
+    temporal_crop_ratio:  tuple = (0.75, 1.0)
+    temporal_min_frames:  int   = 8
+    drop_frames_prob:     float = 0.10
 
 
 # ---------------------------------------------------------------------------
-# Encoder
+# Encoder  (VideoMAE / Video Swin / R3D)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class EncoderConfig:
-    arch:               Literal["r3d", "mc3", "rmc3", "r2plus1d", "r2d"] = "r3d"
-    num_res_layers:     int   = 1
-    out_dim:            int   = 256
-    pooling:            Literal["average", "max"] = "average"
-    pretrained:         bool  = False
-    track_running_stats:bool  = True
+    """
+    Unified encoder config covering both VideoMAE and R3D backends.
+
+    VideoMAE fields (used when arch in {"videomae", "video_swin"})
+    --------------------------------------------------------------
+    videomae_model_name : HF Hub model ID
+    videomae_num_frames : frames to resample to before VideoMAE (default 16)
+    tubelet_size        : temporal patch size in frames (default 2)
+    patch_size          : spatial patch size in pixels (default 16)
+    img_size            : spatial resolution fed to VideoMAE (default 224)
+    freeze_backbone     : if True, backbone weights are frozen (recommended
+                          for first ~5 epochs to stabilise the CTC head)
+
+    R3D fields (used when arch in {"r3d", "mc3", "rmc3", "r2plus1d", "r2d"})
+    -------------------------------------------------------------------------
+    num_res_layers, pooling, track_running_stats  (unchanged from v1)
+
+    Shared fields
+    -------------
+    out_dim    : output feature dim; VideoMAE default = 768 (ViT-B hidden)
+    pretrained : load pretrained weights from Hub / torchvision
+    """
+
+    # ── Backbone selection ────────────────────────────────────────────────
+    arch: Literal[
+        "videomae", "video_swin",
+        "r3d", "mc3", "rmc3", "r2plus1d", "r2d"
+    ] = "videomae"
+
+    # ── VideoMAE-specific ─────────────────────────────────────────────────
+    videomae_model_name: str  = "MCG-NJU/videomae-base"
+    videomae_num_frames: int  = 16      # frames resampled to (model's T input)
+    tubelet_size:        int  = 2       # VideoMAE tube height → T' = 16//2 = 8
+    patch_size:          int  = 16      # spatial patch size (ViT-style)
+    img_size:            int  = 224     # spatial resolution for VideoMAE
+    freeze_backbone:     bool = True    # freeze backbone initially
+
+    # ── R3D-specific ──────────────────────────────────────────────────────
+    num_res_layers:      int  = 1
+    pooling:             Literal["average", "max"] = "average"
+    track_running_stats: bool = True
+
+    # ── Shared ───────────────────────────────────────────────────────────
+    # VideoMAE-B hidden size = 768. If projecting to smaller dim set out_dim.
+    out_dim:    int  = 768
+    pretrained: bool = True
+
+    @property
+    def T_prime(self) -> int:
+        """Number of temporal tokens produced by VideoMAE encoder."""
+        return self.videomae_num_frames // self.tubelet_size
 
 
 # ---------------------------------------------------------------------------
@@ -163,16 +204,16 @@ class EncoderConfig:
 @dataclass
 class RecurrentConfig:
     arch:         Literal["lstm", "gru", "transformer", "none"] = "lstm"
-    hidden_size:  int = 256
-    num_layers:   int = 2
-    nhead:        int = 8
-    ff_dim:       int = 1024
+    hidden_size:  int   = 256
+    num_layers:   int   = 2
+    nhead:        int   = 8
+    ff_dim:       int   = 1024
     dropout:      float = 0.1
-    fc_hidden:    int = 256
+    fc_hidden:    int   = 256
 
 
 # ---------------------------------------------------------------------------
-# Attention Decoder
+# Attention Decoder  (kept for evaluator/decode compatibility; not trained)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -190,42 +231,55 @@ class AttnDecoderConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size:   int   = 4
-    accum_steps:  int   = 4
+    """
+    CTC-only training configuration.
 
-    num_workers:  int   = 2
-    pin_memory:   bool  = False
+    Key changes from hybrid version
+    --------------------------------
+    • batch_size default  → 1  (VideoMAE at 224px needs ~4–8 GB/sample)
+    • lr default          → 1e-4  (lower: large frozen backbone + small head)
+    • Removed: lambda_ctc_start/min, label_smoothing  (attention-only)
+    • Added:   unfreeze_after_epoch  (unfreeze backbone after N epochs)
+    """
+
+    # ── Data loading ──────────────────────────────────────────────────────
+    batch_size:   int  = 1          # VideoMAE VRAM budget; increase if 224px fits
+    accum_steps:  int  = 8          # effective batch 8 with batch_size=1
+
+    num_workers:  int  = 2
+    pin_memory:   bool = False
     persistent_workers: bool = True
 
+    # ── Optimiser ─────────────────────────────────────────────────────────
     num_epochs:   int   = 40
-    lr:           float = 3e-4
+    lr:           float = 1e-4      # lower than hybrid (large pretrained backbone)
     weight_decay: float = 1e-4
     beta1:        float = 0.90
     beta2:        float = 0.98
     grad_clip:    float = 5.0
     optimizer:    Literal["adamw", "adam", "sgd", "rmsprop", "lamb"] = "adamw"
 
+    # ── Scheduler ─────────────────────────────────────────────────────────
     scheduler:    Literal["onecycle", "warmup_multistep", "steplr", "none"] = "onecycle"
     warmup_pct:   float = 0.05
     final_div_factor: float = 300.0
-    scheduler_gamma: float = 0.1
-    scheduler_step:  int   = 5
+    scheduler_gamma:  float = 0.1
+    scheduler_step:   int   = 5
 
-    # Recommended: start low so the attention decoder gets sufficient gradient
-    # signal from the outset. Do not exceed 0.5 — at high lambda the corrupted
-    # CTC loss for repeated-letter words dominates and destabilises training.
-    lambda_ctc_start: float = 0.20   # keep low: high λ amplifies blank-collapse damage
-    lambda_ctc_min:   float = 0.10
-    label_smoothing:  float = 0.10
+    # ── Backbone unfreezing schedule ─────────────────────────────────────
+    # After this many epochs, backbone weights are unfrozen for fine-tuning.
+    # Set to a large value (e.g. 999) to keep backbone frozen permanently.
+    unfreeze_after_epoch: int = 10
 
-    log_interval:  int  = 10
-    val_limit:     Optional[int] = 50
-    qual_every_n:  int  = 5
-    qual_n:        int  = 20
+    # ── Logging / checkpointing ───────────────────────────────────────────
+    log_interval:   int          = 10
+    val_limit:      Optional[int] = 50
+    qual_every_n:   int          = 5
+    qual_n:         int          = 20
 
-    checkpoint_dir: str         = "/kaggle/working/checkpoints"
-    resume_path:    Optional[str] = None
-    save_frequency: int         = 5
+    checkpoint_dir:  str          = "/kaggle/working/checkpoints"
+    resume_path:     Optional[str] = None
+    save_frequency:  int          = 5
 
     seed: int = 42
 
@@ -245,12 +299,16 @@ class Config:
     train:     TrainConfig       = field(default_factory=TrainConfig)
 
     device: torch.device = field(
-        default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        default_factory=lambda: torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
     )
 
     def build(self) -> "Config":
         self.vocab.lang = self.data.lang
         self.vocab.build()
+        # Keep DataConfig.img_size in sync with EncoderConfig.img_size
+        self.data.img_size = self.encoder.img_size
         return self
 
     def log_dir(self) -> str:
