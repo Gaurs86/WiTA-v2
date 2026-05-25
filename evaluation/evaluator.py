@@ -25,6 +25,7 @@ def evaluate_cer(
     dataloader:   DataLoader,
     converter:    StrLabelConverter,
     cfg:          Config,
+    decode_mode:  Literal["ctc", "attn"] = "ctc",
     max_batches:  int | None = None,
 ) -> tuple[float, list[tuple[str, str]]]:
     """
