@@ -267,29 +267,20 @@ class VideoMAEEncoder(nn.Module):
         clips   : [B, T, C, H, W]  raw input (any T, any spatial res)
         returns : [B, T', out_dim]  temporal feature sequence
         """
-        print(f"[DEBUG VideoMAEEncoder] input  shape: {clips.shape}")
-
         # 1. Temporal resampling → [B, num_frames, C, H, W]
         clips = self._resample_temporal(clips)
         # 2. Spatial resize      → [B, num_frames, C, img_size, img_size]
         clips = self._resize_spatial(clips)
-
-        print(f"[DEBUG VideoMAEEncoder] preprocessed shape: {clips.shape}")
 
         # 3. VideoMAE backbone
         #    HF convention: pixel_values [B, T, C, H, W]  (matches our layout)
         outputs = self.backbone(pixel_values=clips)
         hidden  = outputs.last_hidden_state               # [B, N_total, D]
 
-        print(f"[DEBUG VideoMAEEncoder] backbone output shape: {hidden.shape}")
-
         # 4. Pool spatial patches per temporal tube → [B, T', D]
         B, N, D = hidden.shape
         n_spatial = N // self.T_prime                     # re-derive at runtime
         temporal_feat = hidden.view(B, self.T_prime, n_spatial, D).mean(dim=2)
-
-        print(f"[DEBUG VideoMAEEncoder] temporal features shape: {temporal_feat.shape}")
-        print(f"[DEBUG VideoMAEEncoder] T'={temporal_feat.shape[1]}")
 
         # 5. Optional projection
         temporal_feat = self.proj(temporal_feat)          # [B, T', out_dim]
@@ -364,20 +355,12 @@ class VideoSwinEncoder(nn.Module):
         clips   : [B, T, C, H, W]
         returns : [B, T', out_dim]
         """
-        print(f"[DEBUG VideoSwinEncoder] input shape: {clips.shape}")
-
         # Video Swin expects [B, C, T, H, W]
         x = clips.permute(0, 2, 1, 3, 4)                # [B, C, T, H, W]
         x = self.swin(x)                                 # [B, C', T', H', W']
 
-        print(f"[DEBUG VideoSwinEncoder] swin output shape: {x.shape}")
-
         # Pool spatial → [B, C', T', 1, 1] → [B, T', C']
         x = self.spatial_pool(x)
-        x = x.squeeze(-1).squeeze(-1)                   # [B, C', T']
-        x = x.permute(0, 2, 1)                          # [B, T', C']
-
-        print(f"[DEBUG VideoSwinEncoder] temporal features shape: {x.shape}")
 
         x = self.proj(x)                                 # [B, T', out_dim]
         return x
