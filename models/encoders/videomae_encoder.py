@@ -396,18 +396,49 @@ class VideoSwinEncoder(nn.Module):
             )
             print(f"[VideoSwinEncoder] Random init: {arch}")
 
-        # ── Neutralise the classification head ──────────────────────────
-        # NOTE: we do NOT override avgpool/flatten/head here.
+        # ── Hook into the backbone to capture pre-pool features ──────────
         #
-        # torchvision's Swin3D.forward() uses torch.flatten(x, 1) INLINE
-        # (not via self.flatten), so replacing self.backbone.flatten with
-        # Identity() has no effect.  Instead, VideoSwinEncoder._swin_features()
-        # calls the backbone's submodules directly and stops before avgpool,
-        # returning the full [B, C, T', H', W'] feature map.
+        # WHY NOT attribute overrides (avgpool/flatten/head = Identity)?
+        # ---------------------------------------------------------------
+        # Attempt 1 failed: replacing self.backbone.avgpool/flatten/head with
+        # Identity() didn't work because the real class is SwinTransformer3d
+        # (not Swin3D) which uses torch.flatten(x, 1) INLINE in forward(),
+        # so the Identity on self.backbone.flatten is never called.
         #
-        # The only override we keep is head=Identity() as a safety net in
-        # case _swin_features() is ever bypassed (e.g. DataParallel wrapping).
-        self.backbone.head = nn.Identity()
+        # Attempt 2 failed: calling submodules directly via self.backbone.layers
+        # didn't work because SwinTransformer3d uses a different attribute name.
+        #
+        # ROBUST FIX: find the AdaptiveAvgPool3d by TYPE (not by name) and
+        # register a forward pre-hook on it.  The hook fires right before
+        # the pool collapses the spatial dims, capturing [B, C, T', H', W'].
+        # forward() then ignores the backbone's return value entirely and
+        # uses self._pre_pool_feat instead.  This is version-agnostic:
+        # works for Swin3D, SwinTransformer3d, and any future rename.
+        #
+        self._pre_pool_feat: torch.Tensor | None = None
+
+        _pool_layer = None
+        for _name, _mod in self.backbone.named_modules():
+            if isinstance(_mod, nn.AdaptiveAvgPool3d):
+                _pool_layer = _mod
+                print(f"[VideoSwinEncoder] Pre-pool hook → '{_name}' "
+                      f"({type(_mod).__name__})")
+                break
+
+        if _pool_layer is None:
+            raise RuntimeError(
+                f"VideoSwinEncoder: no AdaptiveAvgPool3d found inside "
+                f"{type(self.backbone).__name__}. "
+                "Available modules: "
+                + ", ".join(n for n, _ in self.backbone.named_modules() if n)
+            )
+
+        # Pre-hook receives inp as a tuple; inp[0] is the tensor INPUT to the
+        # pool — shape [B, C, T', H', W'] — which is exactly what we need.
+        def _pre_pool_hook(module: nn.Module, inp: tuple) -> None:
+            self._pre_pool_feat = inp[0]
+
+        self._hook_handle = _pool_layer.register_forward_pre_hook(_pre_pool_hook)
 
         # ── Freeze backbone if requested ─────────────────────────────────
         if self.freeze:
@@ -431,50 +462,6 @@ class VideoSwinEncoder(nn.Module):
             f"[VideoSwinEncoder] arch={arch}, num_frames={self.num_frames}, "
             f"T'={self.T_prime}, backbone_dim={backbone_dim}, out_dim={cfg.out_dim}"
         )
-
-    # ------------------------------------------------------------------
-    # Feature extraction (bypasses inline torch.flatten in Swin3D.forward)
-    # ------------------------------------------------------------------
-
-    def _swin_features(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Run Swin3D submodules up to (but NOT including) avgpool.
-
-        WHY THIS EXISTS
-        ---------------
-        torchvision's Swin3D.forward() uses:
-            x = self.avgpool(x)
-            x = torch.flatten(x, 1)   ← INLINE — not a nn.Module attribute
-            x = self.head(x)
-
-        Setting self.backbone.flatten = Identity() has zero effect because
-        the flatten is a raw function call, not self.flatten(x).  Calling
-        self.backbone(x) and taking its return value will always give a
-        1-D-per-sample tensor after the inline flatten, not the 5-D feature
-        map we need.
-
-        Solution: call each submodule in sequence and return after norm+permute,
-        before avgpool ever runs.
-
-        Submodule names are stable across torchvision 0.15+ for all Swin3D
-        variants (swin3d_t, swin3d_s, swin3d_b).
-
-        Parameters
-        ----------
-        x : [B, C, T, H, W]  — torchvision NCTHW convention
-
-        Returns
-        -------
-        [B, C, T', H', W']  — full spatial feature map before pooling
-        e.g. [B, 768, 16, 7, 7] for swin_t with 32 frames / 224px input
-        """
-        x = self.backbone.patch_embed(x)   # [B, T', H', W', C]  (NTHWC)
-        x = self.backbone.pos_drop(x)
-        for layer in self.backbone.layers:
-            x = layer(x)
-        x = self.backbone.norm(x)           # [B, T', H', W', C]  (NTHWC)
-        x = x.permute(0, 4, 1, 2, 3)       # [B, C, T', H', W']  (NCTHW)
-        return x
 
     # ------------------------------------------------------------------
     # Preprocessing helpers  (mirrors VideoMAEEncoder interface)
@@ -522,9 +509,11 @@ class VideoSwinEncoder(nn.Module):
         # 3. torchvision expects [B, C, T, H, W]
         x = clips.permute(0, 2, 1, 3, 4).contiguous()   # [B, C, T, H, W]
 
-        # 4. Extract features via submodule calls (bypasses inline flatten).
-        #    Returns [B, C, T', H', W'] — full spatial map before avgpool.
-        x = self._swin_features(x)                       # [B, C, T', H', W']
+        # 4. Run backbone to trigger the pre-pool hook.
+        #    We IGNORE the return value (it's a flat [B, C] class vector).
+        #    self._pre_pool_feat is populated by the hook with [B, C, T', H', W'].
+        self.backbone(x)
+        x = self._pre_pool_feat                          # [B, C, T', H', W']
 
         # 5. Spatial mean pool → [B, C, T']
         x = x.mean(dim=[-2, -1])                         # [B, C, T']
