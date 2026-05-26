@@ -397,22 +397,17 @@ class VideoSwinEncoder(nn.Module):
             print(f"[VideoSwinEncoder] Random init: {arch}")
 
         # ── Neutralise the classification head ──────────────────────────
-        # Replace avgpool with spatial-preserving pool so temporal dim survives.
-        # Replace flatten + head with Identity to get raw feature maps out.
+        # NOTE: we do NOT override avgpool/flatten/head here.
         #
-        # torchvision Swin3D forward (simplified):
-        #   x = patch_embed(x)           # NDHWC
-        #   for layer in layers: x = layer(x)
-        #   x = norm(x)                  # NDHWC
-        #   x = x.permute(0,4,1,2,3)    # → NCDHW
-        #   x = avgpool(x)               # [B, C, 1, 1, 1] normally
-        #   x = flatten(x)               # [B, C]
-        #   x = head(x)                  # [B, num_classes]
+        # torchvision's Swin3D.forward() uses torch.flatten(x, 1) INLINE
+        # (not via self.flatten), so replacing self.backbone.flatten with
+        # Identity() has no effect.  Instead, VideoSwinEncoder._swin_features()
+        # calls the backbone's submodules directly and stops before avgpool,
+        # returning the full [B, C, T', H', W'] feature map.
         #
-        # After our overrides backbone returns [B, D, T', H', W']:
-        self.backbone.avgpool  = nn.Identity()
-        self.backbone.flatten  = nn.Identity()
-        self.backbone.head     = nn.Identity()
+        # The only override we keep is head=Identity() as a safety net in
+        # case _swin_features() is ever bypassed (e.g. DataParallel wrapping).
+        self.backbone.head = nn.Identity()
 
         # ── Freeze backbone if requested ─────────────────────────────────
         if self.freeze:
@@ -436,6 +431,50 @@ class VideoSwinEncoder(nn.Module):
             f"[VideoSwinEncoder] arch={arch}, num_frames={self.num_frames}, "
             f"T'={self.T_prime}, backbone_dim={backbone_dim}, out_dim={cfg.out_dim}"
         )
+
+    # ------------------------------------------------------------------
+    # Feature extraction (bypasses inline torch.flatten in Swin3D.forward)
+    # ------------------------------------------------------------------
+
+    def _swin_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run Swin3D submodules up to (but NOT including) avgpool.
+
+        WHY THIS EXISTS
+        ---------------
+        torchvision's Swin3D.forward() uses:
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)   ← INLINE — not a nn.Module attribute
+            x = self.head(x)
+
+        Setting self.backbone.flatten = Identity() has zero effect because
+        the flatten is a raw function call, not self.flatten(x).  Calling
+        self.backbone(x) and taking its return value will always give a
+        1-D-per-sample tensor after the inline flatten, not the 5-D feature
+        map we need.
+
+        Solution: call each submodule in sequence and return after norm+permute,
+        before avgpool ever runs.
+
+        Submodule names are stable across torchvision 0.15+ for all Swin3D
+        variants (swin3d_t, swin3d_s, swin3d_b).
+
+        Parameters
+        ----------
+        x : [B, C, T, H, W]  — torchvision NCTHW convention
+
+        Returns
+        -------
+        [B, C, T', H', W']  — full spatial feature map before pooling
+        e.g. [B, 768, 16, 7, 7] for swin_t with 32 frames / 224px input
+        """
+        x = self.backbone.patch_embed(x)   # [B, T', H', W', C]  (NTHWC)
+        x = self.backbone.pos_drop(x)
+        for layer in self.backbone.layers:
+            x = layer(x)
+        x = self.backbone.norm(x)           # [B, T', H', W', C]  (NTHWC)
+        x = x.permute(0, 4, 1, 2, 3)       # [B, C, T', H', W']  (NCTHW)
+        return x
 
     # ------------------------------------------------------------------
     # Preprocessing helpers  (mirrors VideoMAEEncoder interface)
@@ -483,15 +522,15 @@ class VideoSwinEncoder(nn.Module):
         # 3. torchvision expects [B, C, T, H, W]
         x = clips.permute(0, 2, 1, 3, 4).contiguous()   # [B, C, T, H, W]
 
-        # 4. Backbone forward
-        #    With avgpool/flatten/head = Identity, returns [B, D, T', H', W']
-        x = self.backbone(x)                             # [B, D, T', H', W']
+        # 4. Extract features via submodule calls (bypasses inline flatten).
+        #    Returns [B, C, T', H', W'] — full spatial map before avgpool.
+        x = self._swin_features(x)                       # [B, C, T', H', W']
 
-        # 5. Spatial mean pool → [B, D, T']
-        x = x.mean(dim=[-2, -1])                         # [B, D, T']
+        # 5. Spatial mean pool → [B, C, T']
+        x = x.mean(dim=[-2, -1])                         # [B, C, T']
 
-        # 6. Rearrange to sequence format → [B, T', D]
-        x = x.permute(0, 2, 1)                           # [B, T', D]
+        # 6. Rearrange to sequence format → [B, T', C]
+        x = x.permute(0, 2, 1)                           # [B, T', C]
 
         # 7. Optional projection
         x = self.proj(x)                                  # [B, T', out_dim]
