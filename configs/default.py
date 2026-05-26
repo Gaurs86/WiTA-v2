@@ -248,8 +248,12 @@ class TrainConfig:
     """
 
     # ── Data loading ──────────────────────────────────────────────────────
-    batch_size:   int  = 1          # VideoMAE VRAM budget; increase if 224px fits
-    accum_steps:  int  = 8          # effective batch 8 with batch_size=1
+    # Effective batch = batch_size * accum_steps = 8 (unchanged from before).
+    # batch_size=4 on 2× T4 with DataParallel splits to 2/GPU → ~3.5 GB/GPU
+    # under AMP + gradient checkpointing, well inside the 15 GB budget.
+    # Engages both GPUs and roughly halves wall-clock vs batch_size=1.
+    batch_size:   int  = 4          # was 1; engages DataParallel on 2× T4
+    accum_steps:  int  = 2          # was 8; keeps effective batch = 8
 
     num_workers:  int  = 2
     pin_memory:   bool = False

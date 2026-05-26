@@ -279,18 +279,27 @@ def make_dataloaders(
         pad_idx=cfg.vocab.pad_idx,   # N+4, NOT 0
     )
 
+    # NOTE: pin_memory in this codebase is enabled only with num_workers==0
+    # (per existing convention). If you flip cfg.train.pin_memory=True with
+    # workers>0 later, also adjust this guard.
     pin     = cfg.train.pin_memory and (cfg.train.num_workers == 0)
     persist = cfg.train.num_workers > 0 and cfg.train.persistent_workers
+    # prefetch_factor only applies when num_workers > 0. Each worker holds
+    # `prefetch_factor` batches as PIL/numpy in RAM — keep at 2 (PyTorch
+    # default) so system RAM stays bounded on Kaggle's ~13 GB host.
+    prefetch_kw = {"prefetch_factor": 2} if cfg.train.num_workers > 0 else {}
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.train.batch_size, shuffle=True,
         num_workers=cfg.train.num_workers, collate_fn=collate,
         pin_memory=pin, persistent_workers=persist, drop_last=True,
+        **prefetch_kw,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.train.batch_size, shuffle=False,
         num_workers=cfg.train.num_workers, collate_fn=collate,
         pin_memory=pin, persistent_workers=persist, drop_last=False,
+        **prefetch_kw,
     )
 
     logger.info(

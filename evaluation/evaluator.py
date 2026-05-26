@@ -53,10 +53,10 @@ def evaluate_cer(
             if max_batches is not None and i >= max_batches:
                 break
             clips, labels, input_lens, label_lens = batch
-            clips      = clips.to(device)
-            labels     = labels.to(device)
-            input_lens = input_lens.to(device)
-            label_lens = label_lens.to(device)
+            clips      = clips.to(device, non_blocking=True)
+            labels     = labels.to(device, non_blocking=True)
+            input_lens = input_lens.to(device, non_blocking=True)
+            label_lens = label_lens.to(device, non_blocking=True)
             B          = clips.shape[0]
 
             pred_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)
@@ -105,10 +105,10 @@ def print_sample_table(
             if max_batches is not None and i >= max_batches:
                 break
             clips, labels, input_lens, label_lens = batch
-            clips      = clips.to(device)
-            labels     = labels.to(device)
-            input_lens = input_lens.to(device)
-            label_lens = label_lens.to(device)
+            clips      = clips.to(device, non_blocking=True)
+            labels     = labels.to(device, non_blocking=True)
+            input_lens = input_lens.to(device, non_blocking=True)
+            label_lens = label_lens.to(device, non_blocking=True)
             B = clips.shape[0]
 
             ctc_seqs  = _unwrap(model).decode_ctc_greedy(clips, input_lens)

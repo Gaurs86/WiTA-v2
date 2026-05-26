@@ -129,8 +129,8 @@ def _train_epoch(
         clips, labels, input_lens, label_lens = batch
         clips      = clips.to(cfg.device, non_blocking=True)
         labels     = labels.to(cfg.device, non_blocking=True)
-        input_lens = input_lens.to(cfg.device)
-        label_lens = label_lens.to(cfg.device)
+        input_lens = input_lens.to(cfg.device, non_blocking=True)
+        label_lens = label_lens.to(cfg.device, non_blocking=True)
 
         # ── Single autocast scope: model forward + loss ───────────────────
         # Canonical PyTorch AMP pattern — do NOT split across two scopes.
@@ -138,13 +138,18 @@ def _train_epoch(
             # model returns (ctc_log_probs [B,T,V], enc_lens [B])
             ctc_lp, enc_lens = model(clips, input_lens)
 
-            loss = ctc_loss(
-                ctc_log_probs  = ctc_lp,
-                targets        = labels,
-                input_lengths  = enc_lens,    # ← scaled encoded lengths
-                target_lengths = label_lens,
-                vocab          = cfg.vocab,
-            )
+        # ── CTCLoss in fp32 ───────────────────────────────────────────────
+        # nn.CTCLoss is autocast-promoted to fp32 internally, but fp16
+        # *inputs* from the upstream log_softmax can still produce NaN
+        # gradients. Compute the loss outside the autocast scope with
+        # explicit float32 log-probs.
+        loss = ctc_loss(
+            ctc_log_probs  = ctc_lp.float(),
+            targets        = labels,
+            input_lengths  = enc_lens,    # ← scaled encoded lengths
+            target_lengths = label_lens,
+            vocab          = cfg.vocab,
+        )
 
         # Gradient accumulation
         loss = loss / cfg.train.accum_steps
@@ -213,10 +218,19 @@ def train(
     os.makedirs(cfg.train.checkpoint_dir, exist_ok=True)
     model = model.to(cfg.device)
 
-    if torch.cuda.device_count() > 1 and cfg.train.batch_size >= torch.cuda.device_count():
-        logger.info("DataParallel: %d GPUs — wrapping model",
-                    torch.cuda.device_count())
+    # DataParallel only helps when the batch can actually be split across
+    # devices. With batch_size < device_count, one GPU sits idle and we eat
+    # scatter/gather overhead for nothing — skip wrapping in that case.
+    n_dev = torch.cuda.device_count()
+    if n_dev > 1 and cfg.train.batch_size >= n_dev:
+        logger.info("DataParallel: %d GPUs — wrapping model", n_dev)
         model = nn.DataParallel(model)
+    elif n_dev > 1:
+        logger.info(
+            "DataParallel skipped: batch_size=%d < device_count=%d "
+            "(would idle %d GPU). Using single-GPU training.",
+            cfg.train.batch_size, n_dev, n_dev - 1,
+        )
 
     # Steps-per-epoch for OneCycleLR budget calculation
     _n          = len(train_loader)
@@ -260,6 +274,11 @@ def train(
             logger.info("Epoch %d: unfreezing backbone for end-to-end fine-tuning",
                         epoch)
             _unwrap(model).unfreeze_backbone()
+            # The memory profile is about to grow (activations + grads +
+            # Adam moments for 85M backbone params). Drop the cache so the
+            # allocator doesn't fragment around the old frozen-shape blocks.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         t0 = time.time()
 
@@ -273,6 +292,9 @@ def train(
             decode_mode="ctc",
             max_batches=cfg.train.val_limit,
         )
+        # Release validation-time allocations before the next train epoch.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Qualitative sample table every N epochs
         if (epoch + 1) % cfg.train.qual_every_n == 0:
@@ -302,9 +324,12 @@ def train(
         logger.info(line)
 
         # ── Checkpointing ─────────────────────────────────────────────────
-        latest = os.path.join(cfg.train.checkpoint_dir, "latest.pt")
-        ckpt_save(latest, _unwrap(model), optimizer, scheduler, scaler,
-                  epoch, best_cer, val_cer)
+        # best.pt: always saved on CER improvement (rare; lightweight overall).
+        # latest.pt + epoch_NNN.pt: every cfg.train.save_frequency epochs
+        # (avoid writing ~340 MB every epoch — pure I/O cost, no recovery benefit
+        # beyond what epoch_NNN.pt already gives).
+        is_save_epoch = (epoch + 1) % cfg.train.save_frequency == 0
+        is_final      = (epoch + 1) == cfg.train.num_epochs
 
         if val_cer < best_cer:
             best_cer = val_cer
@@ -313,7 +338,10 @@ def train(
                       epoch, best_cer, val_cer)
             logger.info("★ New best CER=%.4f → %s", best_cer, best)
 
-        if (epoch + 1) % cfg.train.save_frequency == 0:
+        if is_save_epoch or is_final:
+            latest = os.path.join(cfg.train.checkpoint_dir, "latest.pt")
+            ckpt_save(latest, _unwrap(model), optimizer, scheduler, scaler,
+                      epoch, best_cer, val_cer)
             p = os.path.join(cfg.train.checkpoint_dir,
                              f"epoch_{epoch+1:03d}.pt")
             ckpt_save(p, _unwrap(model), optimizer, scheduler, scaler,
