@@ -9,6 +9,14 @@ EncoderConfig
            patch_size, freeze_backbone
   • img_size moved here from DataConfig (VideoMAE needs 224; R3D used 112)
   • out_dim default changed to 768 (VideoMAE-B hidden size)
+  • Added: video_swin_* fields for Video Swin Transformer (torchvision backend)
+    - video_swin_arch          : "swin_t" | "swin_s" | "swin_b"
+    - video_swin_num_frames    : frames to resample to (T' = num_frames // 2)
+    - video_swin_img_size      : spatial resolution (224)
+    - video_swin_patch_size    : (T, H, W) patch strides — (2, 4, 4) for all variants
+    - video_swin_window_size   : (T, H, W) attention window
+    - video_swin_drop_path_rate: stochastic depth rate
+  • T_prime property now returns arch-correct temporal token count
 
 TrainConfig
   • Removed: lambda_ctc_start, lambda_ctc_min, label_smoothing
@@ -175,11 +183,37 @@ class EncoderConfig:
 
     # ── VideoMAE-specific ─────────────────────────────────────────────────
     videomae_model_name: str  = "MCG-NJU/videomae-base"
-    videomae_num_frames: int  = 16      # frames resampled to (model's T input)
-    tubelet_size:        int  = 2       # VideoMAE tube height → T' = 16//2 = 8
+    videomae_num_frames: int  = 32      # frames resampled to → T' = 32//2 = 16
+    tubelet_size:        int  = 2       # VideoMAE tube height → T' = num_frames//2
     patch_size:          int  = 16      # spatial patch size (ViT-style)
     img_size:            int  = 224     # spatial resolution for VideoMAE
     freeze_backbone:     bool = True    # freeze backbone initially
+
+    # ── Video Swin-specific (torchvision backend, no pytorchvideo needed) ─
+    #
+    # video_swin_arch variants and their output dims:
+    #   "swin_t"  → 768   (28M params, Kinetics-400 pretrained)  ← recommended
+    #   "swin_s"  → 768   (49M params)
+    #   "swin_b"  → 1024  (87M params)
+    #
+    # video_swin_patch_size (2, 4, 4):
+    #   Temporal stride=2 → T' = video_swin_num_frames // 2
+    #   For num_frames=32 → T'=16  (vs VideoMAE T'=16 at 32 frames — identical!)
+    #
+    # video_swin_window_size (8, 7, 7):
+    #   T' (16) must be divisible by window_T (8) → 16 % 8 == 0  ✓
+    #   If you change num_frames, verify: (num_frames // 2) % window_T == 0
+    #
+    # video_swin_drop_path_rate:
+    #   Stochastic depth during fine-tuning. 0.2 = swin_t default.
+    #   Backbone frozen → this is dormant during Phase 1 caching.
+    #
+    video_swin_arch:           str                    = "swin_t"
+    video_swin_num_frames:     int                    = 32    # T' = 32 // 2 = 16
+    video_swin_img_size:       int                    = 224
+    video_swin_patch_size:     tuple                  = (2, 4, 4)   # (T, H, W)
+    video_swin_window_size:    tuple                  = (8, 7, 7)   # (T, H, W)
+    video_swin_drop_path_rate: float                  = 0.2
 
     # ── R3D-specific ──────────────────────────────────────────────────────
     num_res_layers:      int  = 1
@@ -187,14 +221,26 @@ class EncoderConfig:
     track_running_stats: bool = True
 
     # ── Shared ───────────────────────────────────────────────────────────
-    # VideoMAE-B hidden size = 768. If projecting to smaller dim set out_dim.
+    # VideoMAE-B hidden size = 768.  Video Swin-T/S = 768, Swin-B = 1024.
+    # Set out_dim to project to a smaller dim (e.g. 512) or leave at 768
+    # for an identity projection.
     out_dim:    int  = 768
     pretrained: bool = True
 
     @property
     def T_prime(self) -> int:
-        """Number of temporal tokens produced by VideoMAE encoder."""
+        """Number of temporal tokens produced by the encoder (arch-aware)."""
+        if self.arch == "video_swin":
+            return self.video_swin_num_frames // self.video_swin_patch_size[0]
+        # VideoMAE (and R3D — approximate, actual T' depends on clip length)
         return self.videomae_num_frames // self.tubelet_size
+
+    @property
+    def effective_img_size(self) -> int:
+        """Spatial resolution clips are resized to before the backbone."""
+        if self.arch == "video_swin":
+            return self.video_swin_img_size
+        return self.img_size
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +289,8 @@ class TrainConfig:
     """
 
     # ── Data loading ──────────────────────────────────────────────────────
-    batch_size:   int  = 1          # VideoMAE VRAM budget; increase if 224px fits
-    accum_steps:  int  = 8          # effective batch 8 with batch_size=1
+    batch_size:   int  = 16         # safe with cached features on T4 (no backbone)
+    accum_steps:  int  = 1          # no accumulation needed at batch=16
 
     num_workers:  int  = 2
     pin_memory:   bool = False
@@ -269,7 +315,9 @@ class TrainConfig:
     # ── Backbone unfreezing schedule ─────────────────────────────────────
     # After this many epochs, backbone weights are unfrozen for fine-tuning.
     # Set to a large value (e.g. 999) to keep backbone frozen permanently.
-    unfreeze_after_epoch: int = 10
+    # With feature caching the backbone is never called during training,
+    # so unfreeze_after_epoch is irrelevant — set high to avoid the call.
+    unfreeze_after_epoch: int = 999
 
     # ── Logging / checkpointing ───────────────────────────────────────────
     log_interval:   int          = 10
@@ -307,8 +355,10 @@ class Config:
     def build(self) -> "Config":
         self.vocab.lang = self.data.lang
         self.vocab.build()
-        # Keep DataConfig.img_size in sync with EncoderConfig.img_size
-        self.data.img_size = self.encoder.img_size
+        # Keep DataConfig.img_size in sync with the arch-appropriate resolution.
+        # effective_img_size returns video_swin_img_size for video_swin arch,
+        # and img_size for VideoMAE / R3D — so this is always correct.
+        self.data.img_size = self.encoder.effective_img_size
         return self
 
     def log_dir(self) -> str:

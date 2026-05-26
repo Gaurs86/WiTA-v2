@@ -4,29 +4,35 @@ models/encoders/videomae_encoder.py — VideoMAE & Video Swin backbones for WiTA
 Architecture overview
 ---------------------
 Input clips [B, T, C, H, W]
-    ↓  temporal resample → num_frames (16)
-    ↓  spatial  resize   → img_size   (224)
-    ↓  VideoMAE backbone
-Patch tokens [B, N_total, hidden_size]        # e.g. [B, 1568, 768]
-    ↓  mean-pool spatial patches per tube
-Temporal features [B, T', hidden_size]        # T' = num_frames // tubelet_size = 8
+    ↓  temporal resample + spatial resize
+    ↓  backbone (VideoMAE or Video Swin)
+Temporal features [B, T', D]
     ↓  optional linear projection → cfg.out_dim
 Output [B, T', out_dim]
 
-Shape walkthrough (defaults: MCG-NJU/videomae-base, 16 frames, 224px)
------------------------------------------------------------------------
-Input          : [B, T,  3, H,   W  ]   e.g. [2, 64, 3, 224, 224]
-After resample : [B, 16, 3, 224, 224]
-After VideoMAE : [B, 1568, 768]          1568 = (16/2) * (224/16)^2 = 8 * 196
-After pooling  : [B, 8,   768]           T' = 8  (temporal tokens only)
-After proj     : [B, 8,   out_dim]       e.g. [B, 8, 768] if out_dim=768
+VideoMAEEncoder (arch="videomae")
+----------------------------------
+Shape walkthrough (defaults: MCG-NJU/videomae-base, 32 frames, 224px)
+    Input          : [B, T,  3, H,   W  ]   e.g. [2, 64, 3, 224, 224]
+    After resample : [B, 32, 3, 224, 224]
+    After VideoMAE : [B, 1568, 768]          1568 = (32/2) * (224/16)^2 = 16 * 196
+    After pooling  : [B, 16, 768]            T' = 16
+    After proj     : [B, 16, out_dim]
 
-Important: T' = 8 means CTC needs target lengths ≤ 8 characters.
-           For longer sequences use cfg.videomae_num_frames=32 (→ T'=16)
-           by fine-tuning with interpolated positional embeddings.
+VideoSwinEncoder (arch="video_swin")
+-------------------------------------
+Uses torchvision.models.video.swin3d_t/s/b — no pytorchvideo required.
+Shape walkthrough (defaults: swin_t, 32 frames, 224px)
+    Input          : [B, T,  3, H,   W  ]   e.g. [2, 64, 3, 224, 224]
+    After resample : [B, 32, 3, 224, 224]
+    After permute  : [B, 3,  32, 224, 224]  (BCTHW for torchvision)
+    After backbone : [B, 768, 16, 7, 7]     T'=32//2=16, spatial=224//32=7
+    After pool     : [B, 16, 768]            spatial mean → temporal sequence
+    After proj     : [B, 16, out_dim]
 
-VideoSwinEncoder is an alternative that naturally supports longer temporal
-sequences via 3D shifted windows (pytorchvideo dependency).
+Both encoders produce T'=16 for num_frames=32 — identical CTC input length.
+The caching pipeline (cache_features.py) works with both architectures
+unchanged since both expose the same forward(clips) → [B, T', out_dim] API.
 """
 
 from __future__ import annotations
@@ -48,12 +54,6 @@ try:
     _HAS_TRANSFORMERS = True
 except ImportError:
     _HAS_TRANSFORMERS = False
-
-try:
-    import pytorchvideo  # noqa: F401
-    _HAS_PYTORCHVIDEO = True
-except ImportError:
-    _HAS_PYTORCHVIDEO = False
 
 
 # ---------------------------------------------------------------------------
@@ -289,80 +289,215 @@ class VideoMAEEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Video Swin Encoder (pytorchvideo alternative)
+# Video Swin Encoder (torchvision backend — no pytorchvideo required)
 # ---------------------------------------------------------------------------
+
+# Supported arch variants: name → (factory_fn, weights_cls, backbone_dim)
+_SWIN_VARIANTS: dict[str, tuple] = {
+    "swin_t": ("swin3d_t", "Swin3D_T_Weights", 768),
+    "swin_s": ("swin3d_s", "Swin3D_S_Weights", 768),
+    "swin_b": ("swin3d_b", "Swin3D_B_Weights", 1024),
+}
+
 
 class VideoSwinEncoder(nn.Module):
     """
-    Video Swin Transformer backbone via pytorchvideo.
+    Video Swin Transformer backbone (torchvision ≥ 0.15) → [B, T', D].
 
-    Outputs [B, T', D] by applying AdaptiveAvgPool over the spatial
-    dimensions of the Swin feature map, preserving the temporal dimension.
+    Uses torchvision.models.video.swin3d_t/s/b — no pytorchvideo dependency.
+    Pretrained weights: Kinetics-400 (KINETICS400_V1).
 
-    Requires: pip install pytorchvideo
+    Architecture flow
+    -----------------
+    Input clips [B, T, C, H, W]
+        ↓  temporal resample → video_swin_num_frames  (default 32)
+        ↓  spatial  resize   → video_swin_img_size    (default 224)
+        ↓  permute → [B, C, T, H, W]  (torchvision convention)
+        ↓  swin3d backbone (avgpool replaced with Identity)
+    Feature map [B, D, T', H', W']   D=768, T'=16, H'=W'=7 for swin_t/32fr/224px
+        ↓  spatial mean pool → [B, D, T']
+        ↓  permute → [B, T', D]
+        ↓  optional linear projection → cfg.out_dim
+    Output [B, T', out_dim]
 
-    Model names (passed as cfg.videomae_model_name):
-      "swin_t"   → Swin-T Kinetics-400  (out_dim≈768 after pool)
-      "swin_s"   → Swin-S
-      "swin_b"   → Swin-B
+    Shape walkthrough (swin_t defaults: 32 frames, 224px)
+    -------------------------------------------------------
+    Input          : [B, T,  3, H,   W  ]   any T, any spatial
+    After resample : [B, 32, 3, 224, 224]
+    After permute  : [B, 3,  32, 224, 224]  (torchvision BCTHW)
+    After backbone : [B, 768, 16, 7, 7]     T'=32//2=16, spatial=224//32=7
+    After mean pool: [B, 768, 16]
+    After permute  : [B, 16, 768]           → CTC input sequence
+    After proj     : [B, 16, out_dim]
 
-    NOTE: Video Swin processes clips of arbitrary length. The temporal
-    downsampling factor is 2x (from the stem), so T' = T_in // 2 (approx).
-    This gives higher temporal resolution than VideoMAE (T'=8) and is
-    better suited for longer sign-language clips.
+    T' = video_swin_num_frames // video_swin_patch_size[0]
+       = 32 // 2 = 16  (same as VideoMAE with 32 frames — cache compatible)
+
+    Requirement: (video_swin_num_frames // 2) % video_swin_window_size[0] == 0
+                 Default: 16 % 8 == 0  ✓
+
+    Unfreeze interface
+    ------------------
+    self.backbone  — the swin3d model (matches VideoMAEEncoder attribute name
+                     so hybrid_model.unfreeze_backbone() works unchanged)
     """
 
     def __init__(self, cfg: EncoderConfig) -> None:
         super().__init__()
-        if not _HAS_PYTORCHVIDEO:
+
+        try:
+            import torchvision.models.video as tvm  # noqa: F401
+        except ImportError:
             raise ImportError(
-                "pytorchvideo required for Video Swin. "
-                "pip install pytorchvideo"
+                "torchvision >= 0.15 is required for VideoSwinEncoder. "
+                "pip install 'torchvision>=0.15'"
             )
 
-        from pytorchvideo.models import create_model  # type: ignore
+        arch = cfg.video_swin_arch.lower()
+        if arch not in _SWIN_VARIANTS:
+            raise ValueError(
+                f"VideoSwinEncoder: unknown video_swin_arch='{arch}'. "
+                f"Choose from {list(_SWIN_VARIANTS.keys())}."
+            )
 
-        model_name = cfg.videomae_model_name if cfg.videomae_model_name else "swin_t"
-        self.swin  = create_model(
-            model_name,
-            pretrained=cfg.pretrained,
-            head=None,               # Remove classification head
-        )
+        self.num_frames  = cfg.video_swin_num_frames
+        self.img_size    = cfg.video_swin_img_size
+        self.patch_t     = cfg.video_swin_patch_size[0]   # temporal stride = 2
+        self.T_prime     = self.num_frames // self.patch_t # e.g. 32 // 2 = 16
+        self.freeze      = cfg.freeze_backbone
 
-        if cfg.freeze_backbone:
-            for p in self.swin.parameters():
+        factory_name, weights_cls_name, backbone_dim = _SWIN_VARIANTS[arch]
+
+        # ── Validate window size divides T' evenly ───────────────────────
+        window_t = cfg.video_swin_window_size[0]
+        if self.T_prime % window_t != 0:
+            raise ValueError(
+                f"VideoSwinEncoder: T'={self.T_prime} "
+                f"(num_frames={self.num_frames} // patch_t={self.patch_t}) "
+                f"is not divisible by window_size[0]={window_t}. "
+                f"Adjust video_swin_num_frames so that "
+                f"(num_frames // {self.patch_t}) % {window_t} == 0."
+            )
+
+        # ── Build backbone ───────────────────────────────────────────────
+        import torchvision.models.video as tvm
+        factory_fn  = getattr(tvm, factory_name)
+        weights_cls = getattr(tvm, weights_cls_name)
+
+        if cfg.pretrained:
+            weights = getattr(weights_cls, "KINETICS400_V1")
+            self.backbone = factory_fn(
+                weights=weights,
+                stochastic_depth_prob=cfg.video_swin_drop_path_rate,
+            )
+            print(f"[VideoSwinEncoder] Loaded Kinetics-400 pretrained: {arch}")
+        else:
+            self.backbone = factory_fn(
+                weights=None,
+                stochastic_depth_prob=cfg.video_swin_drop_path_rate,
+            )
+            print(f"[VideoSwinEncoder] Random init: {arch}")
+
+        # ── Neutralise the classification head ──────────────────────────
+        # Replace avgpool with spatial-preserving pool so temporal dim survives.
+        # Replace flatten + head with Identity to get raw feature maps out.
+        #
+        # torchvision Swin3D forward (simplified):
+        #   x = patch_embed(x)           # NDHWC
+        #   for layer in layers: x = layer(x)
+        #   x = norm(x)                  # NDHWC
+        #   x = x.permute(0,4,1,2,3)    # → NCDHW
+        #   x = avgpool(x)               # [B, C, 1, 1, 1] normally
+        #   x = flatten(x)               # [B, C]
+        #   x = head(x)                  # [B, num_classes]
+        #
+        # After our overrides backbone returns [B, D, T', H', W']:
+        self.backbone.avgpool  = nn.Identity()
+        self.backbone.flatten  = nn.Identity()
+        self.backbone.head     = nn.Identity()
+
+        # ── Freeze backbone if requested ─────────────────────────────────
+        if self.freeze:
+            for p in self.backbone.parameters():
                 p.requires_grad_(False)
-            print(f"[VideoSwinEncoder] Backbone FROZEN ({model_name})")
+            print(f"[VideoSwinEncoder] Backbone parameters FROZEN")
+        else:
+            print(f"[VideoSwinEncoder] Backbone parameters trainable")
 
-        # Spatial pool to get temporal-only features
-        self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+        # ── Optional output projection ───────────────────────────────────
+        if cfg.out_dim != backbone_dim:
+            self.proj = nn.Linear(backbone_dim, cfg.out_dim)
+            print(f"[VideoSwinEncoder] Projection {backbone_dim} → {cfg.out_dim}")
+        else:
+            self.proj = nn.Identity()
 
-        # Probe the actual output channel count
-        _test  = torch.zeros(1, 3, 8, 224, 224)
-        with torch.no_grad():
-            _out = self.swin(_test)               # [1, C, T', 1, 1] or similar
-        _C     = _out.shape[1]
-        self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+        self.out_dim      = cfg.out_dim
+        self.backbone_dim = backbone_dim
 
-        self.proj = (
-            nn.Linear(_C, cfg.out_dim) if _C != cfg.out_dim else nn.Identity()
+        print(
+            f"[VideoSwinEncoder] arch={arch}, num_frames={self.num_frames}, "
+            f"T'={self.T_prime}, backbone_dim={backbone_dim}, out_dim={cfg.out_dim}"
         )
-        self.out_dim = cfg.out_dim
-        print(f"[VideoSwinEncoder] backbone_dim={_C}, out_dim={cfg.out_dim}")
+
+    # ------------------------------------------------------------------
+    # Preprocessing helpers  (mirrors VideoMAEEncoder interface)
+    # ------------------------------------------------------------------
+
+    def _resample_temporal(self, clips: torch.Tensor) -> torch.Tensor:
+        """
+        Uniformly sample self.num_frames from clips along the time axis.
+        clips : [B, T, C, H, W]
+        """
+        B, T, C, H, W = clips.shape
+        if T == self.num_frames:
+            return clips
+        idx = torch.linspace(0, T - 1, self.num_frames,
+                             device=clips.device).long()
+        return clips[:, idx]
+
+    def _resize_spatial(self, clips: torch.Tensor) -> torch.Tensor:
+        """
+        Bilinearly resize (H, W) → (img_size, img_size).
+        clips : [B, T, C, H, W]
+        """
+        B, T, C, H, W = clips.shape
+        if H == self.img_size and W == self.img_size:
+            return clips
+        x = clips.view(B * T, C, H, W)
+        x = F.interpolate(x, size=(self.img_size, self.img_size),
+                          mode="bilinear", align_corners=False)
+        return x.view(B, T, C, self.img_size, self.img_size)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self, clips: torch.Tensor) -> torch.Tensor:
         """
-        clips   : [B, T, C, H, W]
-        returns : [B, T', out_dim]
+        clips   : [B, T, C, H, W]  raw input (any T, any spatial res)
+        returns : [B, T', out_dim]  temporal feature sequence
         """
-        # Video Swin expects [B, C, T, H, W]
-        x = clips.permute(0, 2, 1, 3, 4)                # [B, C, T, H, W]
-        x = self.swin(x)                                 # [B, C', T', H', W']
+        # 1. Temporal resampling → [B, num_frames, C, H, W]
+        clips = self._resample_temporal(clips)
+        # 2. Spatial resize      → [B, num_frames, C, img_size, img_size]
+        clips = self._resize_spatial(clips)
 
-        # Pool spatial → [B, C', T', 1, 1] → [B, T', C']
-        x = self.spatial_pool(x)
+        # 3. torchvision expects [B, C, T, H, W]
+        x = clips.permute(0, 2, 1, 3, 4).contiguous()   # [B, C, T, H, W]
 
-        x = self.proj(x)                                 # [B, T', out_dim]
+        # 4. Backbone forward
+        #    With avgpool/flatten/head = Identity, returns [B, D, T', H', W']
+        x = self.backbone(x)                             # [B, D, T', H', W']
+
+        # 5. Spatial mean pool → [B, D, T']
+        x = x.mean(dim=[-2, -1])                         # [B, D, T']
+
+        # 6. Rearrange to sequence format → [B, T', D]
+        x = x.permute(0, 2, 1)                           # [B, T', D]
+
+        # 7. Optional projection
+        x = self.proj(x)                                  # [B, T', out_dim]
+
         return x
 
 
