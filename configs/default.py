@@ -125,7 +125,8 @@ class DataConfig:
 
 @dataclass
 class AugConfig:
-    mirror_prob:     float = 0.30
+    # Horizontal flip mirrors glyphs (b↔d, p↔q). Disabled for char recognition.
+    mirror_prob:     float = 0.0
     rotation_deg:    float = 5.0
     brightness:      float = 0.50
     contrast:        float = 0.50
@@ -175,7 +176,11 @@ class EncoderConfig:
 
     # ── VideoMAE-specific ─────────────────────────────────────────────────
     videomae_model_name: str  = "MCG-NJU/videomae-base"
-    videomae_num_frames: int  = 16      # frames resampled to (model's T input)
+    # T' = num_frames // tubelet_size. T'=8 (16 frames) is too short for many
+    # English labels after sep-token insertion ("suggestion"→11 tokens), causing
+    # CTCLoss to emit inf and be silenced by zero_infinity=True. T'=16 (32
+    # frames) covers the dataset. Pos-embed interpolation handles the mismatch.
+    videomae_num_frames: int  = 32      # frames resampled to (model's T input)
     tubelet_size:        int  = 2       # VideoMAE tube height → T' = 16//2 = 8
     patch_size:          int  = 16      # spatial patch size (ViT-style)
     img_size:            int  = 224     # spatial resolution for VideoMAE
@@ -255,7 +260,8 @@ class TrainConfig:
     lr:           float = 1e-4      # lower than hybrid (large pretrained backbone)
     weight_decay: float = 1e-4
     beta1:        float = 0.90
-    beta2:        float = 0.98
+    # VideoMAE/ViT fine-tuning recipe uses 0.999 (not 0.98).
+    beta2:        float = 0.999
     grad_clip:    float = 5.0
     optimizer:    Literal["adamw", "adam", "sgd", "rmsprop", "lamb"] = "adamw"
 
@@ -270,6 +276,10 @@ class TrainConfig:
     # After this many epochs, backbone weights are unfrozen for fine-tuning.
     # Set to a large value (e.g. 999) to keep backbone frozen permanently.
     unfreeze_after_epoch: int = 10
+
+    # Discriminative LR: backbone uses `backbone_lr_mult * lr`. Standard for
+    # pretrained ViT fine-tuning. Applied via a second optimizer param group.
+    backbone_lr_mult: float = 0.1
 
     # ── Logging / checkpointing ───────────────────────────────────────────
     log_interval:   int          = 10

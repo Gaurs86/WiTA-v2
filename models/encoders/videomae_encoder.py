@@ -141,6 +141,15 @@ class VideoMAEEncoder(nn.Module):
         else:
             print("[VideoMAEEncoder] Backbone parameters trainable")
 
+        # ── Gradient checkpointing ───────────────────────────────────────────
+        # Trades ~30% extra compute for ~30–40% VRAM savings during the
+        # backward pass — necessary for VideoMAE-B on a 15 GB T4 once the
+        # backbone is unfrozen. Activated unconditionally; it's a no-op when
+        # the backbone is frozen and torch.no_grad() bypasses the cache anyway.
+        if hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable()
+            print("[VideoMAEEncoder] Gradient checkpointing ENABLED")
+
         # ── Optional output projection ───────────────────────────────────────
         if cfg.out_dim != self.hidden_size:
             self.proj = nn.Linear(self.hidden_size, cfg.out_dim)
@@ -227,21 +236,46 @@ class VideoMAEEncoder(nn.Module):
     # Preprocessing helpers
     # ------------------------------------------------------------------
 
-    def _resample_temporal(self, clips: torch.Tensor) -> torch.Tensor:
+    def _resample_temporal(
+        self,
+        clips:    torch.Tensor,
+        seq_lens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Uniformly sample self.num_frames from clips along the time axis.
 
         Uses torch.linspace index selection (nearest-neighbour) to avoid
         any trainable parameters or gradient flow through the resampling.
 
-        clips : [B, T, C, H, W]
+        If `seq_lens` is provided, sampling is done per-sample over each
+        clip's *valid* length so we never sample padded zero frames into
+        the encoder. This matters when batch_size > 1.
+
+        clips    : [B, T, C, H, W]
+        seq_lens : [B] valid frame counts (optional; defaults to full T)
         """
         B, T, C, H, W = clips.shape
-        if T == self.num_frames:
+
+        # Fast path: all valid, already correct length, no padding to skip.
+        if seq_lens is None and T == self.num_frames:
             return clips
-        idx = torch.linspace(0, T - 1, self.num_frames,
-                              device=clips.device).long()  # [num_frames]
-        return clips[:, idx]  # [B, num_frames, C, H, W]
+
+        if seq_lens is None:
+            idx = torch.linspace(0, T - 1, self.num_frames,
+                                  device=clips.device).long()  # [num_frames]
+            return clips[:, idx]
+
+        # Per-sample sampling over valid range. Build a [B, num_frames] index
+        # tensor with linspace(0, seq_lens[b]-1) per row, then gather.
+        seq_lens = seq_lens.to(clips.device).clamp(min=1, max=T)
+        base = torch.linspace(0, 1, self.num_frames, device=clips.device)  # [num_frames]
+        # idx[b, t] = round(base[t] * (seq_lens[b] - 1))
+        idx = (base.unsqueeze(0) * (seq_lens.float() - 1).unsqueeze(1)).round().long()
+        idx = idx.clamp(min=0, max=T - 1)                                # [B, num_frames]
+
+        # Gather along T: expand idx to [B, num_frames, C, H, W]
+        idx_exp = idx.view(B, self.num_frames, 1, 1, 1).expand(B, self.num_frames, C, H, W)
+        return torch.gather(clips, 1, idx_exp)
 
     def _resize_spatial(self, clips: torch.Tensor) -> torch.Tensor:
         """
@@ -262,20 +296,33 @@ class VideoMAEEncoder(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, clips: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        clips:    torch.Tensor,
+        seq_lens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
-        clips   : [B, T, C, H, W]  raw input (any T, any spatial res)
-        returns : [B, T', out_dim]  temporal feature sequence
+        clips    : [B, T, C, H, W]  raw input (any T, any spatial res)
+        seq_lens : [B] valid frame counts per sample (optional)
+        returns  : [B, T', out_dim]  temporal feature sequence
         """
         # 1. Temporal resampling → [B, num_frames, C, H, W]
-        clips = self._resample_temporal(clips)
+        #    seq_lens enables per-sample sampling over the valid range only,
+        #    so padded zero frames never reach the backbone.
+        clips = self._resample_temporal(clips, seq_lens)
         # 2. Spatial resize      → [B, num_frames, C, img_size, img_size]
         clips = self._resize_spatial(clips)
 
         # 3. VideoMAE backbone
         #    HF convention: pixel_values [B, T, C, H, W]  (matches our layout)
-        outputs = self.backbone(pixel_values=clips)
-        hidden  = outputs.last_hidden_state               # [B, N_total, D]
+        #    While frozen, skip activation caching with no_grad to save VRAM.
+        if self.freeze:
+            with torch.no_grad():
+                outputs = self.backbone(pixel_values=clips)
+                hidden  = outputs.last_hidden_state           # [B, N_total, D]
+        else:
+            outputs = self.backbone(pixel_values=clips)
+            hidden  = outputs.last_hidden_state               # [B, N_total, D]
 
         # 4. Pool spatial patches per temporal tube → [B, T', D]
         B, N, D = hidden.shape
@@ -286,6 +333,16 @@ class VideoMAEEncoder(nn.Module):
         temporal_feat = self.proj(temporal_feat)          # [B, T', out_dim]
 
         return temporal_feat
+
+    # ------------------------------------------------------------------
+    # Backbone unfreeze hook — disable no_grad / re-enable activation cache
+    # ------------------------------------------------------------------
+
+    def unfreeze(self) -> None:
+        """Switch encoder out of frozen mode so forward stops using no_grad."""
+        self.freeze = False
+        for p in self.backbone.parameters():
+            p.requires_grad_(True)
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +407,11 @@ class VideoSwinEncoder(nn.Module):
         self.out_dim = cfg.out_dim
         print(f"[VideoSwinEncoder] backbone_dim={_C}, out_dim={cfg.out_dim}")
 
-    def forward(self, clips: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        clips:    torch.Tensor,
+        seq_lens: torch.Tensor | None = None,           # accepted for parity
+    ) -> torch.Tensor:
         """
         clips   : [B, T, C, H, W]
         returns : [B, T', out_dim]

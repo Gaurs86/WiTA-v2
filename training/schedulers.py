@@ -26,11 +26,18 @@ class WarmupMultiStepLR(_LRScheduler):
 
 
 def build_scheduler(optimizer, total_steps: int, cfg: TrainConfig):
-    """Return the configured scheduler (or None)."""
+    """Return the configured scheduler (or None).
+
+    For OneCycleLR with multiple param groups, max_lr is a list — one entry
+    per group, taken from each group's "lr" key (set in build_optimizer).
+    """
     stype = cfg.scheduler.lower()
     if stype == "onecycle":
+        max_lr_per_group = [g["lr"] for g in optimizer.param_groups]
         return torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=cfg.lr, total_steps=total_steps,
+            optimizer,
+            max_lr=max_lr_per_group if len(max_lr_per_group) > 1 else cfg.lr,
+            total_steps=total_steps,
             pct_start=cfg.warmup_pct, anneal_strategy="cos",
             final_div_factor=cfg.final_div_factor,
         )

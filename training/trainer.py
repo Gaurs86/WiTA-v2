@@ -62,6 +62,43 @@ def _unwrap(m: nn.Module) -> nn.Module:
     return m.module if isinstance(m, nn.DataParallel) else m
 
 
+def _build_param_groups(model: nn.Module, cfg: Config) -> list[dict]:
+    """
+    Split parameters into backbone vs head groups for discriminative LR.
+
+    Backbone group: encoder.backbone.* (the pretrained VideoMAE / Video Swin).
+    Head group    : everything else (recurrent head, CTC projection, encoder
+                    projection if any).
+
+    The backbone group's "lr" is cfg.train.lr * cfg.train.backbone_lr_mult.
+    Both groups carry weight_decay = cfg.train.weight_decay.
+
+    Note: parameters are included in the optimizer even when requires_grad is
+    False at startup. AdamW skips updates for params whose .grad is None, so
+    the frozen-warmup phase is unaffected. Once unfreeze_backbone() flips
+    requires_grad, gradients flow and the backbone group steps at its lower
+    LR — the schedule never needs to know about the unfreeze event.
+    """
+    inner = _unwrap(model)
+    backbone_params: list = []
+    head_params:     list = []
+
+    encoder = getattr(inner, "encoder", None)
+    backbone = getattr(encoder, "backbone", None) if encoder is not None else None
+    backbone_ids = {id(p) for p in backbone.parameters()} if backbone is not None else set()
+
+    for p in inner.parameters():
+        (backbone_params if id(p) in backbone_ids else head_params).append(p)
+
+    head_lr     = cfg.train.lr
+    backbone_lr = cfg.train.lr * cfg.train.backbone_lr_mult
+
+    groups = [{"params": head_params, "lr": head_lr, "name": "head"}]
+    if backbone_params:
+        groups.append({"params": backbone_params, "lr": backbone_lr, "name": "backbone"})
+    return groups
+
+
 # ---------------------------------------------------------------------------
 # Single training epoch
 # ---------------------------------------------------------------------------
@@ -188,8 +225,16 @@ def train(
     steps_per_epoch = max(1, _full + _remainder)
     total_steps     = cfg.train.num_epochs * steps_per_epoch
 
-    optimizer = build_optimizer(model.parameters(), cfg.train)
-    scheduler = build_scheduler(optimizer, total_steps, cfg.train)
+    # Discriminative LR: backbone gets cfg.train.backbone_lr_mult × head LR.
+    # build_scheduler will read each group's "lr" for OneCycleLR.max_lr.
+    param_groups = _build_param_groups(model, cfg)
+    optimizer    = build_optimizer(param_groups, cfg.train)
+    scheduler    = build_scheduler(optimizer, total_steps, cfg.train)
+    logger.info(
+        "Optimizer param groups: %s",
+        ", ".join(f"{g.get('name','?')}(lr={g['lr']:.2e}, n={len(g['params'])})"
+                  for g in optimizer.param_groups),
+    )
     scaler    = GradScaler(device=_amp_device, enabled=_use_amp)
 
     start_epoch = 0

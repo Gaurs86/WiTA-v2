@@ -172,16 +172,22 @@ class WiTACTCModel(nn.Module):
     # Internal encode helper
     # ------------------------------------------------------------------
 
-    def _encode(self, clips: torch.Tensor) -> torch.Tensor:
+    def _encode(
+        self,
+        clips:    torch.Tensor,
+        seq_lens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         clips [B, T, C, H, W] → enc_features [B, T', enc_dim]
 
-        VideoMAE expects [B, T, C, H, W] — no permute needed.
-        R3D expects [B, C, T, H, W] — permuted here.
+        VideoMAE expects [B, T, C, H, W] — no permute needed. seq_lens is
+        forwarded so the encoder can sample frames per-sample from each
+        clip's valid range (avoiding padding when batch_size > 1).
+        R3D expects [B, C, T, H, W] — permuted here; no seq_lens needed.
         """
         arch = self.cfg.encoder.arch.lower()
         if arch in ("videomae", "video_swin"):
-            return self.encoder(clips)                      # already [B,T,C,H,W]
+            return self.encoder(clips, seq_lens)            # already [B,T,C,H,W]
         else:
             return self.encoder(clips.permute(0, 2, 1, 3, 4))  # → [B,C,T,H,W]
 
@@ -220,8 +226,9 @@ class WiTACTCModel(nn.Module):
         """
         T_raw = clips.shape[1]
 
-        # 1. Visual backbone
-        enc_features = self._encode(clips)                  # [B, T', D]
+        # 1. Visual backbone (pass seq_lens so VideoMAE samples per-sample
+        #    across the valid range, not the padded length).
+        enc_features = self._encode(clips, seq_lens)        # [B, T', D]
         T_enc        = enc_features.shape[1]
 
         # 2. Scale raw frame lengths → encoded frame lengths
@@ -248,8 +255,12 @@ class WiTACTCModel(nn.Module):
         ec   = self.cfg.encoder
         arch = ec.arch.lower()
         if arch in ("videomae", "video_swin"):
-            for p in self.encoder.backbone.parameters():
-                p.requires_grad_(True)
+            # Prefer the encoder's own hook (also flips the no_grad path).
+            if hasattr(self.encoder, "unfreeze"):
+                self.encoder.unfreeze()
+            else:
+                for p in self.encoder.backbone.parameters():
+                    p.requires_grad_(True)
             print("[WiTACTCModel] Backbone UNFROZEN — full fine-tuning enabled")
         else:
             print("[WiTACTCModel] R3D backbone: no freezing was applied; "
@@ -272,7 +283,7 @@ class WiTACTCModel(nn.Module):
         with blank tokens and consecutive duplicates removed.
         """
         T_raw    = clips.shape[1]
-        enc      = self._encode(clips)
+        enc      = self._encode(clips, seq_lens)
         T_enc    = enc.shape[1]
         enc_lens = self._compute_enc_lens(seq_lens, T_enc, T_raw)
 
