@@ -213,7 +213,7 @@ def train(
     os.makedirs(cfg.train.checkpoint_dir, exist_ok=True)
     model = model.to(cfg.device)
 
-    if torch.cuda.device_count() > 1:
+    if torch.cuda.device_count() > 1 and cfg.train.batch_size >= torch.cuda.device_count():
         logger.info("DataParallel: %d GPUs — wrapping model",
                     torch.cuda.device_count())
         model = nn.DataParallel(model)

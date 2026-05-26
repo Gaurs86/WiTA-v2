@@ -109,7 +109,7 @@ class WiTACTCModel(nn.Module):
         # ── Blank bias initialisation ────────────────────────────────────
         # Sets P(blank) ≈ 0.70 at init so repeated-character words can be
         # aligned by CTC from the first step (Bug A fix — kept from hybrid).
-        self._init_blank_bias(vc.blank_idx, p_blank=0.70)
+        self._init_blank_bias(vc.blank_idx, p_blank=0.30)
 
         print(
             f"[WiTACTCModel] encoder_dim={encoder_dim}, "
