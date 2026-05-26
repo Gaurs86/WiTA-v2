@@ -34,31 +34,14 @@ Kept / fixed
 • AMP-compatible (no internal autocast; trainer owns the scope)
 • CTCProjection now uses GELU instead of ReLU (Bug D fix)
 • WiTAHybridModel alias for backward compatibility
-
-Debug prints (disable by setting WiTA_DEBUG=0)
-----------------------------------------------
-Printed to stdout during forward pass:
-  [DEBUG WiTACTCModel] input clip shape: ...
-  [DEBUG WiTACTCModel] encoder output shape: ...
-  [DEBUG WiTACTCModel] T_raw=..., T_enc=...
-  [DEBUG WiTACTCModel] CTC logits shape: ...
 """
 
 from __future__ import annotations
-import os
 import torch
 import torch.nn as nn
 
 from ..configs.default import Config, EncoderConfig
 from .modules.recurrent import build_recurrent_head, CTCProjection
-
-# Debug flag — set env var WiTA_DEBUG=0 to silence
-_DEBUG = os.environ.get("WiTA_DEBUG", "1") != "0"
-
-
-def _dbg(msg: str) -> None:
-    if _DEBUG:
-        print(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -220,14 +203,10 @@ class WiTACTCModel(nn.Module):
         all English fingerspelling words in the WiTA dataset.
         (Previous T'=8 caused CTC collapse on >8-char words.)"""
         T_raw = clips.shape[1]
-        _dbg(f"[DEBUG WiTACTCModel] input clip shape:    {list(clips.shape)}")
 
         # 1. Visual backbone (or pass-through if clips is pre-extracted [B,T',D])
         enc_features = self._encode(clips)                  # [B, T', D]
         T_enc        = enc_features.shape[1]
-
-        _dbg(f"[DEBUG WiTACTCModel] encoder output shape: {list(enc_features.shape)}")
-        _dbg(f"[DEBUG WiTACTCModel] T_raw={T_raw}, T_enc={T_enc}")
 
         # 2. Scale raw frame lengths → encoded frame lengths.
         #    For cached features seq_lens already equals T_enc (set by
@@ -240,8 +219,6 @@ class WiTACTCModel(nn.Module):
         # 4. CTC projection + log-softmax
         ctc_logits    = self.ctc_proj(rnn_out)              # [B, T', V]
         ctc_log_probs = ctc_logits.log_softmax(-1)          # [B, T', V]
-
-        _dbg(f"[DEBUG WiTACTCModel] CTC logits shape:     {list(ctc_log_probs.shape)}")
 
         return ctc_log_probs, enc_lens
 
