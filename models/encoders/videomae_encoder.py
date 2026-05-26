@@ -388,13 +388,11 @@ class VideoSwinEncoder(nn.Module):
             weights = getattr(weights_cls, "KINETICS400_V1")
             self.backbone = factory_fn(
                 weights=weights,
-                stochastic_depth_prob=cfg.video_swin_drop_path_rate,
             )
             print(f"[VideoSwinEncoder] Loaded Kinetics-400 pretrained: {arch}")
         else:
             self.backbone = factory_fn(
                 weights=None,
-                stochastic_depth_prob=cfg.video_swin_drop_path_rate,
             )
             print(f"[VideoSwinEncoder] Random init: {arch}")
 
