@@ -30,21 +30,35 @@ Removed from hybrid version
 
 Kept / fixed
 ------------
-• _init_blank_bias()   — p_blank=0.70 positive bias (Bug A fix preserved)
 • _compute_enc_lens()  — ratio-based scaling (Bug C fix preserved)
 • AMP-compatible (no internal autocast; trainer owns the scope)
 • CTCProjection now uses GELU instead of ReLU (Bug D fix)
 • WiTAHybridModel alias for backward compatibility
 
+Debug prints (disable by setting WiTA_DEBUG=0)
+----------------------------------------------
+Printed to stdout during forward pass:
+  [DEBUG WiTACTCModel] input clip shape: ...
+  [DEBUG WiTACTCModel] encoder output shape: ...
+  [DEBUG WiTACTCModel] T_raw=..., T_enc=...
+  [DEBUG WiTACTCModel] CTC logits shape: ...
 """
 
 from __future__ import annotations
-import math
+import os
 import torch
 import torch.nn as nn
 
 from ..configs.default import Config, EncoderConfig
 from .modules.recurrent import build_recurrent_head, CTCProjection
+
+# Debug flag — set env var WiTA_DEBUG=0 to silence
+_DEBUG = os.environ.get("WiTA_DEBUG", "1") != "0"
+
+
+def _dbg(msg: str) -> None:
+    if _DEBUG:
+        print(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -106,34 +120,11 @@ class WiTACTCModel(nn.Module):
             cfg=rc,
         )
 
-        # ── Blank bias initialisation ────────────────────────────────────
-        # Sets P(blank) ≈ 0.70 at init so repeated-character words can be
-        # aligned by CTC from the first step (Bug A fix — kept from hybrid).
-        self._init_blank_bias(vc.blank_idx, p_blank=0.70)
-
         print(
             f"[WiTACTCModel] encoder_dim={encoder_dim}, "
             f"rnn_out_dim={rnn_out_dim}, "
             f"ctc_vocab_size={vc.ctc_vocab_size}"
         )
-
-    # ------------------------------------------------------------------
-    # Blank bias  (Bug A fix preserved from hybrid model)
-    # ------------------------------------------------------------------
-
-    def _init_blank_bias(self, blank_idx: int, p_blank: float = 0.70) -> None:
-        """
-        Initialise the CTC projection's blank logit so P(blank) ≈ p_blank.
-
-        Formula (softmax inverse, all other logits ≈ 0 at init):
-            b = log(p_blank * (V-1) / (1 - p_blank))
-
-        For V=28, p_blank=0.70: b ≈ +4.14  ← POSITIVE (not -3.0)
-        """
-        V = self.ctc_proj.fc2.out_features
-        b = math.log(p_blank * (V - 1) / (1.0 - p_blank))
-        with torch.no_grad():
-            self.ctc_proj.fc2.bias.data[blank_idx] = b
 
     # ------------------------------------------------------------------
     # Encoded length scaling  (Bug C fix preserved from hybrid model)
@@ -174,11 +165,18 @@ class WiTACTCModel(nn.Module):
 
     def _encode(self, clips: torch.Tensor) -> torch.Tensor:
         """
-        clips [B, T, C, H, W] → enc_features [B, T', enc_dim]
+        clips [B, T, C, H, W]  → enc_features [B, T', enc_dim]   (raw frames)
+        clips [B, T', D]        → enc_features [B, T', D]          (cached feats)
 
-        VideoMAE expects [B, T, C, H, W] — no permute needed.
-        R3D expects [B, C, T, H, W] — permuted here.
+        When using CachedFeaturesDataset the loader yields [B, T', D] tensors
+        (pre-extracted VideoMAE features). Detecting ndim==3 lets us skip the
+        entire backbone forward pass — only BiLSTM + CTC head run per step.
+        This is what makes training go from 1000s/epoch → ~5s/epoch on T4.
         """
+        if clips.ndim == 3:
+            # Already extracted features [B, T', D] — skip backbone entirely
+            return clips
+
         arch = self.cfg.encoder.arch.lower()
         if arch in ("videomae", "video_swin"):
             return self.encoder(clips)                      # already [B,T,C,H,W]
@@ -209,22 +207,31 @@ class WiTACTCModel(nn.Module):
 
         IMPORTANT: always use enc_lens (not raw seq_lens) for CTCLoss.
 
-        Shape walkthrough (VideoMAE-base defaults)
-        ------------------------------------------
+        Shape walkthrough (VideoMAE-base, num_frames=32)
+        -------------------------------------------------
         clips         [B, T,  3, 224, 224]  e.g. T=64
-        enc_features  [B, 8,  768]           T'=8 from VideoMAE+pool
-        rnn_out       [B, 8,  512]           BiLSTM hidden_size=256 × 2
-        ctc_logits    [B, 8,  28]            ctc_vocab_size=28
-        ctc_log_probs [B, 8,  28]
+        enc_features  [B, 16, 768]           T'=16 from VideoMAE+pool (32fr÷2)
+        rnn_out       [B, 16, 512]           BiLSTM hidden_size=256 × 2
+        ctc_logits    [B, 16, 28]            ctc_vocab_size=28
+        ctc_log_probs [B, 16, 28]
         → CTCLoss wants [T', B, 28] = permute(1, 0, 2)
-        """
-        T_raw = clips.shape[1]
 
-        # 1. Visual backbone
+        With T'=16 CTC can align words up to 16 chars — covers virtually
+        all English fingerspelling words in the WiTA dataset.
+        (Previous T'=8 caused CTC collapse on >8-char words.)"""
+        T_raw = clips.shape[1]
+        _dbg(f"[DEBUG WiTACTCModel] input clip shape:    {list(clips.shape)}")
+
+        # 1. Visual backbone (or pass-through if clips is pre-extracted [B,T',D])
         enc_features = self._encode(clips)                  # [B, T', D]
         T_enc        = enc_features.shape[1]
 
-        # 2. Scale raw frame lengths → encoded frame lengths
+        _dbg(f"[DEBUG WiTACTCModel] encoder output shape: {list(enc_features.shape)}")
+        _dbg(f"[DEBUG WiTACTCModel] T_raw={T_raw}, T_enc={T_enc}")
+
+        # 2. Scale raw frame lengths → encoded frame lengths.
+        #    For cached features seq_lens already equals T_enc (set by
+        #    CachedFeaturesDataset) so _compute_enc_lens returns them unchanged.
         enc_lens = self._compute_enc_lens(seq_lens, T_enc, T_raw)  # [B]
 
         # 3. Optional recurrent head
@@ -233,6 +240,8 @@ class WiTACTCModel(nn.Module):
         # 4. CTC projection + log-softmax
         ctc_logits    = self.ctc_proj(rnn_out)              # [B, T', V]
         ctc_log_probs = ctc_logits.log_softmax(-1)          # [B, T', V]
+
+        _dbg(f"[DEBUG WiTACTCModel] CTC logits shape:     {list(ctc_log_probs.shape)}")
 
         return ctc_log_probs, enc_lens
 
