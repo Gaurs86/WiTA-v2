@@ -108,6 +108,7 @@ def extract_siglip_features(
     -------
     The same dict that was saved to disk.
     """
+    import sys, time
     encoder = encoder.to(device).eval()
     image_size = encoder.image_size
     D = encoder.out_dim
@@ -117,8 +118,14 @@ def extract_siglip_features(
     lengths:     list[int]          = []
 
     total_clips = len(samples)
-    log_every   = max(1, total_clips // 20)
+    # Visible progress every ~1% (or every clip for tiny smoke tests).
+    # Uses print(..., flush=True) instead of logger so Jupyter cells show it
+    # immediately even if logging is misconfigured by the host.
+    log_every   = max(1, total_clips // 100)
     skipped     = 0
+    t0          = time.time()
+    print(f"[feature_cache] Encoding {total_clips} clips with {encoder.model_name} "
+          f"on {device} (image_size={image_size}, dtype={dtype})", flush=True)
 
     for ci, (frame_bytes, label) in enumerate(samples):
         try:
@@ -149,9 +156,15 @@ def extract_siglip_features(
         lengths.append(clip_feats.shape[0])
 
         if (ci + 1) % log_every == 0 or (ci + 1) == total_clips:
-            logger.info(
-                "[feature_cache] %d/%d clips encoded  (skipped=%d)",
-                ci + 1, total_clips, skipped,
+            elapsed = time.time() - t0
+            rate    = (ci + 1) / max(elapsed, 1e-3)
+            eta     = (total_clips - (ci + 1)) / max(rate, 1e-3)
+            print(
+                f"[feature_cache] {ci + 1}/{total_clips} clips  "
+                f"({100*(ci+1)/total_clips:5.1f}%)  "
+                f"{rate:.1f} clips/s  ETA {eta/60:5.1f} min  "
+                f"skipped={skipped}",
+                flush=True,
             )
 
     cache = {

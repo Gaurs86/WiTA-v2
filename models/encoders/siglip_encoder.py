@@ -85,6 +85,10 @@ class SigLIPVisionEncoder(nn.Module):
         self.image_size = image_size
         self.use_pooler = use_pooler
 
+        # Loud progress — first run downloads ~1.5GB of weights for so400m
+        # and Jupyter doesn't always surface HF's tqdm bars.
+        print(f"[SigLIPVisionEncoder] Loading vision encoder: {model_name} "
+              f"(first run downloads weights — be patient)", flush=True)
         self.backbone: nn.Module = SiglipVisionModel.from_pretrained(model_name)
         self.out_dim: int = self.backbone.config.hidden_size
 
@@ -93,6 +97,11 @@ class SigLIPVisionEncoder(nn.Module):
             p.requires_grad = False
         self.backbone.eval()
 
+        print(
+            f"[SigLIPVisionEncoder] {model_name} loaded — "
+            f"out_dim={self.out_dim}, image_size={image_size}, frozen",
+            flush=True,
+        )
         logger.info(
             "[SigLIPVisionEncoder] %s loaded — out_dim=%d, image_size=%d, frozen",
             model_name, self.out_dim, image_size,

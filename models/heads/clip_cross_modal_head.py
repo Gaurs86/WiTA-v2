@@ -249,12 +249,18 @@ def build_prototypes(
 
     Returns the prototypes as float32 on CPU.  Caller decides where to move them.
     """
+    import sys
     try:
         from transformers import SiglipTextModel, AutoTokenizer
     except ImportError as e:
         raise ImportError("transformers>=4.40 required for SigLIP") from e
 
+    # Loud prints because this triggers a one-time HF download (~400MB for so400m)
+    # — silent hangs at first use are confusing.
+    print(f"[build_prototypes] Loading SigLIP text encoder: {model_name} "
+          f"(first run downloads weights — be patient)", flush=True)
     text_model = SiglipTextModel.from_pretrained(model_name).to(device).eval()
+    print(f"[build_prototypes] Text encoder loaded on {device}.", flush=True)
     tokenizer  = AutoTokenizer.from_pretrained(model_name)
 
     prompts: list[str] = [""] * ctc_vocab_size
@@ -263,11 +269,13 @@ def build_prototypes(
         prompts[i + 1] = char_template.format(ch=ch)
     prompts[sep_idx]   = sep_template
 
+    print(f"[build_prototypes] Encoding {ctc_vocab_size} character prompts...", flush=True)
     inputs = tokenizer(
         prompts, return_tensors="pt", padding="max_length", truncation=True,
     ).to(device)
     out = text_model(**inputs)
     feats = out.pooler_output  # [V, D]
+    print(f"[build_prototypes] Prototypes built: shape={tuple(feats.shape)}", flush=True)
 
     # Free GPU memory immediately — text model is single-use here.
     del text_model
