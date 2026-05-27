@@ -163,6 +163,32 @@ class XCLIPVideoEncoder(nn.Module):
     # Forward                                                            #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _to_tensor(out) -> torch.Tensor:
+        """
+        Extract a [B, D] tensor from whatever XCLIPModel.get_video_features
+        returns.  Different transformers versions return either:
+          - torch.Tensor directly                  (canonical)
+          - BaseModelOutputWithPooling             (some versions)
+          - tuple (last_hidden_state, pooled, ...) (return_dict=False path)
+        """
+        if torch.is_tensor(out):
+            return out
+        pooler = getattr(out, "pooler_output", None)
+        if pooler is not None:
+            return pooler
+        last = getattr(out, "last_hidden_state", None)
+        if last is not None:
+            return last.mean(dim=1) if last.dim() == 3 else last
+        if isinstance(out, (tuple, list)) and len(out) >= 2 and torch.is_tensor(out[1]):
+            return out[1]
+        if isinstance(out, (tuple, list)) and len(out) >= 1 and torch.is_tensor(out[0]):
+            return out[0]
+        raise TypeError(
+            f"Could not extract a tensor from XCLIPModel.get_video_features "
+            f"output of type {type(out).__name__}"
+        )
+
     @torch.no_grad()
     def encode_segment(self, segment: torch.Tensor) -> torch.Tensor:
         """
@@ -175,7 +201,40 @@ class XCLIPVideoEncoder(nn.Module):
             raise ValueError(
                 f"Expected [B, num_frames, 3, H, W], got {tuple(segment.shape)}"
             )
-        return self.backbone.get_video_features(pixel_values=segment)
+        try:
+            out = self.backbone.get_video_features(pixel_values=segment)
+            return self._to_tensor(out)
+        except Exception as e:
+            # Manual fallback: run the X-CLIP pipeline ourselves.
+            # vision_model → visual_projection → multiframe integration → pool.
+            # This matches the canonical get_video_features implementation
+            # in transformers/models/x_clip/modeling_x_clip.py.
+            logger.warning(
+                "get_video_features failed (%s) — falling back to manual pipeline.", e,
+            )
+            return self._manual_video_features(segment)
+
+    @torch.no_grad()
+    def _manual_video_features(self, segment: torch.Tensor) -> torch.Tensor:
+        """
+        Manual X-CLIP video feature pipeline.  Mirrors HuggingFace's reference
+        get_video_features but doesn't rely on its tensor-vs-output-object
+        return contract.
+        """
+        B, T, C, H, W = segment.shape
+        flat = segment.reshape(B * T, C, H, W)
+
+        # 1. Per-frame ViT
+        vis_out = self.backbone.vision_model(pixel_values=flat)
+        vis_pooled = self._to_tensor(vis_out)        # [B*T, hidden]
+
+        # 2. Visual projection to common dim
+        projected = self.backbone.visual_projection(vis_pooled)  # [B*T, proj]
+
+        # 3. Reshape and apply Multiframe Integration Transformer
+        cls_feats = projected.view(B, T, -1)
+        mit_out   = self.backbone.mit(cls_feats)
+        return self._to_tensor(mit_out)              # [B, proj]
 
     @torch.no_grad()
     def encode_clip(
