@@ -148,10 +148,15 @@ class CLIPCrossModalHead(nn.Module):
                      (build with build_prototypes()).
     adapter_arch   : 'lstm' | 'conv' | 'transformer' | 'none'
     adapter_hidden : hidden dim inside the adapter
-    init_tau       : initial value for temperature (log space).  CLIP-style
-                     0.07 is the canonical inverse-temperature initialization;
-                     we store log_tau so it stays positive.
-    learnable_tau  : if True, log_tau is trainable; if False, frozen.
+    init_tau       : initial value for temperature.  In the L2-normalized
+                     similarity setting, cosine sims are in [-1, 1] and we
+                     multiply by 1/tau.  init_tau=1.0 → logit range ≈ [-1, 1]
+                     (well-conditioned at init).  init_tau=0.07 (CLIP-style)
+                     gives logit range ≈ [-14, +14], which is overly sharp
+                     for a randomly-initialized projection layer and was the
+                     cause of the Run-7 mode collapse.  Default is 1.0; allow
+                     the learnable parameter to find a sharper value if needed.
+    learnable_tau  : if True, log_inv_tau is trainable; if False, frozen.
     """
 
     def __init__(
@@ -162,7 +167,7 @@ class CLIPCrossModalHead(nn.Module):
         adapter_hidden: int   = 512,
         adapter_layers: int   = 1,
         dropout:        float = 0.1,
-        init_tau:       float = 0.07,
+        init_tau:       float = 1.0,
         learnable_tau:  bool  = True,
     ):
         super().__init__()
@@ -211,14 +216,31 @@ class CLIPCrossModalHead(nn.Module):
         mask:         torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        visual_feats : [B, T, visual_dim]  (frozen SigLIP features)
+        visual_feats : [B, T, visual_dim]  (frozen V-L features)
         mask         : [B, T] bool, True at PAD positions  (transformer only)
         returns      : ctc_log_probs [B, T, V]
+
+        Numerical stability (Run-7 post-mortem fix)
+        -------------------------------------------
+        Both sides are L2-normalized before the dot product — this is how
+        CLIP/SigLIP/X-CLIP were trained and how they are used at inference.
+        Without normalization, the dot-product magnitude depends on the
+        random init of `self.proj`, which combined with a sharp temperature
+        (inv_tau ≈ 14 from init_tau=0.07) saturates the softmax at init →
+        vanishing CTC gradient → mode collapse.
+
+        With both sides L2-normed, the dot product lives in [-1, 1] and
+        inv_tau controls a well-conditioned cosine similarity.
         """
         h = self.adapter(visual_feats, mask=mask)        # [B, T, H]
         z = self.proj(h)                                  # [B, T, D]
-        # Logits: [B, T, D] @ [D, V] → [B, T, V]
-        logits = z @ self.prototypes.t()
+
+        # L2-normalize both sides → cosine similarity in [-1, 1].
+        z_n     = F.normalize(z, dim=-1, eps=1e-6)
+        proto_n = F.normalize(self.prototypes, dim=-1, eps=1e-6)   # [V, D]
+
+        # Logits: [B, T, D] @ [D, V] → [B, T, V],  range [-inv_tau, +inv_tau]
+        logits = z_n @ proto_n.t()
         logits = logits * self.log_inv_tau.exp()
         return F.log_softmax(logits, dim=-1)
 
@@ -233,52 +255,75 @@ def build_prototypes(
     blank_idx:    int,
     sep_idx:      int,
     ctc_vocab_size: int,
-    model_name:   str = "google/siglip-so400m-patch14-384",
+    model_name:   str = "google/siglip-so400m-patch14-224",
     char_template:  str = "the letter {ch}",
     blank_template: str = "no character",
     sep_template:   str = "a brief pause between letters",
     device:       str | torch.device = "cpu",
 ) -> torch.Tensor:
     """
-    Build a [ctc_vocab_size, D] tensor of prototypes via SigLIP text encoder.
+    Build a [ctc_vocab_size, D] tensor of prototypes via the chosen model's
+    text encoder.  Dispatches between SigLIP and X-CLIP based on model_name.
 
     Layout (matches VocabConfig):
       idx 0           : blank (encoded from `blank_template`)
       idx 1..N        : chars (encoded from `char_template.format(ch=...)`)
       idx N+1         : separator (encoded from `sep_template`)
 
-    Returns the prototypes as float32 on CPU.  Caller decides where to move them.
+    Supported backbones
+    -------------------
+      siglip   : "google/siglip-*"   → SiglipTextModel.pooler_output
+      xclip    : "microsoft/xclip-*" → XCLIPModel.get_text_features (projected)
+
+    Returns prototypes as float32 on CPU.  Caller decides where to move them.
     """
-    import sys
     try:
-        from transformers import SiglipTextModel, AutoTokenizer
+        from transformers import AutoTokenizer
     except ImportError as e:
-        raise ImportError("transformers>=4.40 required for SigLIP") from e
+        raise ImportError("transformers>=4.40 required") from e
 
-    # Loud prints because this triggers a one-time HF download (~400MB for so400m)
-    # — silent hangs at first use are confusing.
-    print(f"[build_prototypes] Loading SigLIP text encoder: {model_name} "
-          f"(first run downloads weights — be patient)", flush=True)
-    text_model = SiglipTextModel.from_pretrained(model_name).to(device).eval()
-    print(f"[build_prototypes] Text encoder loaded on {device}.", flush=True)
-    tokenizer  = AutoTokenizer.from_pretrained(model_name)
+    is_xclip  = "xclip"  in model_name.lower()
+    is_siglip = "siglip" in model_name.lower()
 
+    # Build the per-class prompts (same for both backbones).
     prompts: list[str] = [""] * ctc_vocab_size
     prompts[blank_idx] = blank_template
     for i, ch in enumerate(chars):
         prompts[i + 1] = char_template.format(ch=ch)
     prompts[sep_idx]   = sep_template
 
-    print(f"[build_prototypes] Encoding {ctc_vocab_size} character prompts...", flush=True)
-    inputs = tokenizer(
-        prompts, return_tensors="pt", padding="max_length", truncation=True,
-    ).to(device)
-    out = text_model(**inputs)
-    feats = out.pooler_output  # [V, D]
-    print(f"[build_prototypes] Prototypes built: shape={tuple(feats.shape)}", flush=True)
+    print(f"[build_prototypes] Loading text encoder: {model_name} "
+          f"(first run downloads weights — be patient)", flush=True)
 
-    # Free GPU memory immediately — text model is single-use here.
-    del text_model
+    if is_xclip:
+        # X-CLIP exposes get_text_features on the full XCLIPModel only.
+        from transformers import XCLIPModel
+        full = XCLIPModel.from_pretrained(model_name).to(device).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        inputs = tokenizer(
+            prompts, return_tensors="pt", padding=True, truncation=True,
+        ).to(device)
+        # [V, projection_dim]   (512 for xclip-base)
+        feats = full.get_text_features(**inputs)
+        del full
+    elif is_siglip:
+        from transformers import SiglipTextModel
+        text_model = SiglipTextModel.from_pretrained(model_name).to(device).eval()
+        tokenizer  = AutoTokenizer.from_pretrained(model_name)
+        inputs = tokenizer(
+            prompts, return_tensors="pt", padding="max_length", truncation=True,
+        ).to(device)
+        feats = text_model(**inputs).pooler_output    # [V, hidden_size]
+        del text_model
+    else:
+        raise ValueError(
+            f"Unsupported model_name for prototype building: {model_name}. "
+            "Expected a SigLIP or X-CLIP HF model id."
+        )
+
+    print(f"[build_prototypes] Prototypes built: shape={tuple(feats.shape)}",
+          flush=True)
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

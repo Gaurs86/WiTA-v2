@@ -73,20 +73,34 @@ class WiTACLIPCTCModel(nn.Module):
             )
 
         # ── Prototypes ───────────────────────────────────────────────────
+        # Dispatch prompt templates and text-encoder model based on arch.
+        arch = (getattr(ec, "arch", "") or "").lower()
+        if arch == "xclip":
+            proto_model = getattr(ec, "xclip_model_name",
+                                  "microsoft/xclip-base-patch16-zero-shot")
+            proto_char  = getattr(ec, "xclip_char_template",
+                                  "writing the letter {ch} in the air")
+            proto_blank = getattr(ec, "xclip_blank_template", "no writing")
+            proto_sep   = getattr(ec, "xclip_sep_template",
+                                  "a brief pause between letters")
+        else:  # siglip is the default cross-modal path
+            proto_model = getattr(ec, "siglip_model_name",
+                                  "google/siglip-so400m-patch14-224")
+            proto_char  = getattr(ec, "siglip_char_template", "the letter {ch}")
+            proto_blank = getattr(ec, "siglip_blank_template", "no character")
+            proto_sep   = getattr(ec, "siglip_sep_template",
+                                  "a brief pause between letters")
+
         if prototypes is None:
             prototypes = build_prototypes(
                 chars          = vc.chars,
                 blank_idx      = vc.blank_idx,
                 sep_idx        = vc.sep_idx,
                 ctc_vocab_size = vc.ctc_vocab_size,
-                model_name     = getattr(ec, "siglip_model_name",
-                                          "google/siglip-so400m-patch14-384"),
-                char_template  = getattr(ec, "siglip_char_template",
-                                          "the letter {ch}"),
-                blank_template = getattr(ec, "siglip_blank_template",
-                                          "no character"),
-                sep_template   = getattr(ec, "siglip_sep_template",
-                                          "a brief pause between letters"),
+                model_name     = proto_model,
+                char_template  = proto_char,
+                blank_template = proto_blank,
+                sep_template   = proto_sep,
             )
         if prototypes.shape != (vc.ctc_vocab_size, self._visual_dim):
             raise ValueError(
@@ -119,16 +133,32 @@ class WiTACLIPCTCModel(nn.Module):
     # Encoder management                                                 #
     # ------------------------------------------------------------------ #
 
-    def _ensure_encoder(self) -> SigLIPVisionEncoder:
-        """Build the SigLIP encoder lazily for online forward()."""
+    def _ensure_encoder(self):
+        """
+        Build the vision encoder lazily for online forward().
+
+        Dispatches to SigLIP or X-CLIP based on cfg.encoder.arch.  Most users
+        will never hit this path — training uses cached features.  Online
+        forward is primarily for ad-hoc inference / debugging.
+        """
         if self.encoder is None:
-            ec = self.cfg.encoder
-            self.encoder = SigLIPVisionEncoder(
-                model_name = getattr(ec, "siglip_model_name",
-                                      "google/siglip-so400m-patch14-384"),
-                image_size = ec.img_size,
-            )
-            # Move to the same device as the head's prototypes.
+            ec   = self.cfg.encoder
+            arch = (getattr(ec, "arch", "") or "").lower()
+            if arch == "xclip":
+                from .encoders.xclip_encoder import XCLIPVideoEncoder
+                self.encoder = XCLIPVideoEncoder(
+                    model_name = getattr(ec, "xclip_model_name",
+                                          "microsoft/xclip-base-patch16-zero-shot"),
+                    image_size = ec.img_size,
+                    num_frames = getattr(ec, "xclip_num_frames", 8),
+                    stride     = getattr(ec, "xclip_stride", 4),
+                )
+            else:
+                self.encoder = SigLIPVisionEncoder(
+                    model_name = getattr(ec, "siglip_model_name",
+                                          "google/siglip-so400m-patch14-224"),
+                    image_size = ec.img_size,
+                )
             self.encoder = self.encoder.to(self.head.prototypes.device)
         return self.encoder
 

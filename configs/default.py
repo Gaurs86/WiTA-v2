@@ -173,7 +173,21 @@ class EncoderConfig:
         "videomae", "video_swin",
         "r3d", "mc3", "rmc3", "r2plus1d", "r2d",
         "siglip",
+        "xclip",
     ] = "videomae"
+
+    # ── X-CLIP video-language (used when arch == "xclip") ─────────────────
+    # Sliding 8-frame windows are encoded by X-CLIP and cached.  Cross-modal
+    # head uses X-CLIP text encoder to build per-character prototypes.
+    # Unlike per-frame SigLIP, each segment feature encodes MOTION within
+    # the 8 frames — this is the fix for the Run-7 mode collapse.
+    xclip_model_name:     str   = "microsoft/xclip-base-patch16-zero-shot"
+    xclip_num_frames:     int   = 8       # must match the checkpoint
+    xclip_stride:         int   = 4       # sliding-window stride over the raw clip
+    xclip_char_template:  str   = "writing the letter {ch} in the air"
+    xclip_blank_template: str   = "no writing"
+    xclip_sep_template:   str   = "a brief pause between letters"
+    # The head fields are shared with SigLIP (siglip_temporal_arch etc.).
 
     # ── SigLIP cross-modal (used when arch == "siglip") ───────────────────
     # Frozen vision encoder + frozen text-derived character prototypes.
@@ -323,6 +337,10 @@ class TrainConfig:
     # When set, training loads cached features instead of running the
     # SigLIP vision encoder online.
     siglip_feature_cache: Optional[str] = "/kaggle/working/siglip_features.pt"
+
+    # ── X-CLIP cached-feature training (cfg.encoder.arch == "xclip") ──────
+    # Path to the .pt file produced by datasets/video_feature_cache.py.
+    xclip_feature_cache: Optional[str] = "/kaggle/working/xclip_features.pt"
 
     seed: int = 42
 
