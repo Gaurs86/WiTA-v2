@@ -179,7 +179,14 @@ class EncoderConfig:
     # Frozen vision encoder + frozen text-derived character prototypes.
     # Only the temporal adapter + projection are trained.
     # See models/clip_ctc_model.py and models/heads/clip_cross_modal_head.py.
-    siglip_model_name:      str   = "google/siglip-so400m-patch14-384"
+    #
+    # Default model is the 224-input So400m variant — matches the WiTA frame
+    # resolution (224×224) natively, no upscaling needed.
+    # Alternatives:
+    #   "google/siglip-base-patch16-224"     — smaller (87M, dim=768), faster
+    #   "google/siglip-so400m-patch14-384"   — larger input, requires upscale
+    #   "google/siglip2-so400m-patch14-224"  — newer SigLIP2 (needs transformers>=4.50)
+    siglip_model_name:      str   = "google/siglip-so400m-patch14-224"
     siglip_char_template:   str   = "the letter {ch}"
     siglip_blank_template:  str   = "no character"
     siglip_sep_template:    str   = "a brief pause between letters"
