@@ -8,7 +8,8 @@ torch>=2.1.0
 torchvision>=0.16.0
 
 # ── VideoMAE backbone (HuggingFace) ─────────────────────────
-transformers>=4.26.0
+# >=4.40 required for SigLIP-So400m support
+transformers>=4.40.0
 
 # ── Vision & data ───────────────────────────────────────────
 Pillow>=9.0.0

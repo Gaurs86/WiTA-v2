@@ -171,8 +171,24 @@ class EncoderConfig:
     # ── Backbone selection ────────────────────────────────────────────────
     arch: Literal[
         "videomae", "video_swin",
-        "r3d", "mc3", "rmc3", "r2plus1d", "r2d"
+        "r3d", "mc3", "rmc3", "r2plus1d", "r2d",
+        "siglip",
     ] = "videomae"
+
+    # ── SigLIP cross-modal (used when arch == "siglip") ───────────────────
+    # Frozen vision encoder + frozen text-derived character prototypes.
+    # Only the temporal adapter + projection are trained.
+    # See models/clip_ctc_model.py and models/heads/clip_cross_modal_head.py.
+    siglip_model_name:      str   = "google/siglip-so400m-patch14-384"
+    siglip_char_template:   str   = "the letter {ch}"
+    siglip_blank_template:  str   = "no character"
+    siglip_sep_template:    str   = "a brief pause between letters"
+    siglip_temporal_arch:   Literal["lstm", "conv", "transformer", "none"] = "lstm"
+    siglip_adapter_hidden:  int   = 512
+    siglip_adapter_layers:  int   = 1
+    siglip_dropout:         float = 0.1
+    siglip_init_tau:        float = 0.07
+    siglip_learnable_tau:   bool  = True
 
     # ── VideoMAE-specific ─────────────────────────────────────────────────
     videomae_model_name: str  = "MCG-NJU/videomae-base"
@@ -294,6 +310,12 @@ class TrainConfig:
     checkpoint_dir:  str          = "/kaggle/working/checkpoints"
     resume_path:     Optional[str] = None
     save_frequency:  int          = 5
+
+    # ── SigLIP cached-feature training (cfg.encoder.arch == "siglip") ─────
+    # Path to the .pt file produced by datasets/feature_cache.py.
+    # When set, training loads cached features instead of running the
+    # SigLIP vision encoder online.
+    siglip_feature_cache: Optional[str] = "/kaggle/working/siglip_features.pt"
 
     seed: int = 42
 
