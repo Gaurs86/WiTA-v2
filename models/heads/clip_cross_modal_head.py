@@ -295,6 +295,27 @@ def build_prototypes(
     print(f"[build_prototypes] Loading text encoder: {model_name} "
           f"(first run downloads weights — be patient)", flush=True)
 
+    # Same robust unwrapping used in the X-CLIP encoder — some transformers
+    # versions return BaseModelOutputWithPooling from get_*_features instead
+    # of a raw tensor.
+    def _to_tensor(out):
+        if torch.is_tensor(out):
+            return out
+        pooler = getattr(out, "pooler_output", None)
+        if pooler is not None:
+            return pooler
+        last = getattr(out, "last_hidden_state", None)
+        if last is not None:
+            return last.mean(dim=1) if last.dim() == 3 else last
+        if isinstance(out, (tuple, list)) and len(out) >= 2 and torch.is_tensor(out[1]):
+            return out[1]
+        if isinstance(out, (tuple, list)) and len(out) >= 1 and torch.is_tensor(out[0]):
+            return out[0]
+        raise TypeError(
+            f"Could not extract a tensor from text-encoder output of type "
+            f"{type(out).__name__}"
+        )
+
     if is_xclip:
         # X-CLIP exposes get_text_features on the full XCLIPModel only.
         from transformers import XCLIPModel
@@ -303,8 +324,19 @@ def build_prototypes(
         inputs = tokenizer(
             prompts, return_tensors="pt", padding=True, truncation=True,
         ).to(device)
-        # [V, projection_dim]   (512 for xclip-base)
-        feats = full.get_text_features(**inputs)
+        # Some transformers versions return BaseModelOutputWithPooling
+        # instead of a tensor — handle both.
+        try:
+            raw = full.get_text_features(**inputs)
+            feats = _to_tensor(raw)
+        except Exception as e:
+            # Manual fallback: text_model → projection.
+            logger.warning(
+                "get_text_features failed (%s) — using manual fallback.", e,
+            )
+            text_out = full.text_model(**inputs)
+            text_pooled = _to_tensor(text_out)
+            feats = full.text_projection(text_pooled)
         del full
     elif is_siglip:
         from transformers import SiglipTextModel
@@ -313,7 +345,7 @@ def build_prototypes(
         inputs = tokenizer(
             prompts, return_tensors="pt", padding="max_length", truncation=True,
         ).to(device)
-        feats = text_model(**inputs).pooler_output    # [V, hidden_size]
+        feats = _to_tensor(text_model(**inputs))     # [V, hidden_size]
         del text_model
     else:
         raise ValueError(
