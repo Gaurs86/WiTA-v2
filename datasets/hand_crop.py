@@ -34,13 +34,45 @@ at 30+ FPS on CPU, so the added latency is acceptable for real-time use.
 """
 
 from __future__ import annotations
+import os
 import logging
+import urllib.request
 from typing import Optional
 
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Hand landmarker model file (Tasks API)
+# ---------------------------------------------------------------------------
+# Downloaded once on first use; cached under ~/.cache/wita_v2/.
+_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/latest/hand_landmarker.task"
+)
+
+
+def _ensure_landmarker_model() -> str:
+    """Download hand_landmarker.task if not cached locally; return its path."""
+    cache_dir = os.environ.get(
+        "WITA_HAND_LANDMARKER_DIR",
+        os.path.expanduser("~/.cache/wita_v2"),
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    model_path = os.path.join(cache_dir, "hand_landmarker.task")
+    if not os.path.exists(model_path):
+        print(
+            f"[HandCropper] Downloading hand_landmarker model "
+            f"({_LANDMARKER_MODEL_URL}) → {model_path}",
+            flush=True,
+        )
+        urllib.request.urlretrieve(_LANDMARKER_MODEL_URL, model_path)
+        print(f"[HandCropper] Downloaded {os.path.getsize(model_path)/1e6:.1f} MB",
+              flush=True)
+    return model_path
 
 
 class HandCropper:
@@ -73,8 +105,7 @@ class HandCropper:
             import mediapipe as mp
         except ImportError as e:
             raise ImportError(
-                "mediapipe required for hand cropping. "
-                "pip install mediapipe"
+                "mediapipe required for hand cropping. pip install mediapipe"
             ) from e
 
         self.target_size           = target_size
@@ -82,14 +113,61 @@ class HandCropper:
         self.require_any_detection = require_any_detection
         self._mp                   = mp
 
-        # MediaPipe Hands instance.  static_image_mode=False enables tracking
-        # across calls within the same process — faster for sequential frames.
-        self.hands = mp.solutions.hands.Hands(
-            static_image_mode        = False,
-            max_num_hands            = max_num_hands,
-            min_detection_confidence = min_detection_confidence,
-            min_tracking_confidence  = min_tracking_confidence,
-        )
+        # Try the new Tasks API first (mediapipe >= 0.10.x), fall back to
+        # the legacy `mp.solutions.hands` API if available.  In current
+        # mediapipe builds the legacy `solutions` module has been removed.
+        self._api = None
+        self.landmarker = None
+        self.hands      = None
+
+        try:
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision as mp_vision
+        except ImportError:
+            mp_python = None
+            mp_vision = None
+
+        if mp_python is not None and mp_vision is not None:
+            try:
+                model_path = _ensure_landmarker_model()
+                base_options = mp_python.BaseOptions(model_asset_path=model_path)
+                options = mp_vision.HandLandmarkerOptions(
+                    base_options                  = base_options,
+                    num_hands                     = max_num_hands,
+                    min_hand_detection_confidence = min_detection_confidence,
+                    min_hand_presence_confidence  = min_detection_confidence,
+                    # In IMAGE mode min_tracking_confidence is ignored, but
+                    # we set it for parity with the legacy API.
+                    min_tracking_confidence       = min_tracking_confidence,
+                    running_mode                  = mp_vision.RunningMode.IMAGE,
+                )
+                self.landmarker = mp_vision.HandLandmarker.create_from_options(options)
+                self._api = "tasks"
+                logger.info("[HandCropper] using Tasks API (HandLandmarker)")
+            except Exception as e:
+                logger.warning(
+                    "[HandCropper] Tasks API init failed (%s); "
+                    "will try legacy solutions API.", e,
+                )
+
+        if self._api is None:
+            # Legacy fallback — works in mediapipe 0.10.0–0.10.14.
+            solutions = getattr(mp, "solutions", None)
+            if solutions is None or not hasattr(solutions, "hands"):
+                raise ImportError(
+                    f"mediapipe {getattr(mp, '__version__', '?')} exposes "
+                    "neither Tasks API nor solutions.hands. Try: "
+                    "`pip install 'mediapipe==0.10.14'` for the legacy path, "
+                    "or update to a version that supports mediapipe.tasks."
+                )
+            self.hands = solutions.hands.Hands(
+                static_image_mode        = False,
+                max_num_hands            = max_num_hands,
+                min_detection_confidence = min_detection_confidence,
+                min_tracking_confidence  = min_tracking_confidence,
+            )
+            self._api = "solutions"
+            logger.info("[HandCropper] using legacy solutions.hands API")
 
         # Stats — useful diagnostic to print after extracting a whole dataset.
         self.n_clips_seen      = 0
@@ -100,7 +178,10 @@ class HandCropper:
 
     def close(self) -> None:
         """Release MediaPipe resources."""
-        if self.hands is not None:
+        if self._api == "tasks" and self.landmarker is not None:
+            self.landmarker.close()
+            self.landmarker = None
+        if self._api == "solutions" and self.hands is not None:
             self.hands.close()
             self.hands = None
 
@@ -111,21 +192,43 @@ class HandCropper:
     def _detect_bbox(self, frame: Image.Image) -> Optional[tuple[int, int, int, int]]:
         """
         Return (x0, y0, x1, y1) bbox in pixel coords of the largest detected
-        hand in `frame`, or None if no hand found.
+        hand in `frame`, or None if no hand found.  Dispatches between the
+        Tasks and legacy solutions APIs.
         """
-        rgb = np.asarray(frame.convert("RGB"))
-        # MediaPipe expects RGB uint8 — no extra conversion needed.
-        results = self.hands.process(rgb)
-        if not results.multi_hand_landmarks:
-            return None
-
+        rgb = np.asarray(frame.convert("RGB"))   # H, W, 3 uint8
         h, w = rgb.shape[:2]
-        # If multi_num_hands>1, pick the largest bbox.
+
+        if self._api == "tasks":
+            mp_image = self._mp.Image(
+                image_format=self._mp.ImageFormat.SRGB, data=rgb,
+            )
+            result = self.landmarker.detect(mp_image)
+            hand_landmark_lists = result.hand_landmarks
+            if not hand_landmark_lists:
+                return None
+            # In Tasks API each "hand" is a list of NormalizedLandmark
+            # (with .x and .y in [0, 1]).
+            def _coords(hand_lm_list):
+                xs = [lm.x for lm in hand_lm_list]
+                ys = [lm.y for lm in hand_lm_list]
+                return xs, ys
+            iter_hands = hand_landmark_lists
+
+        else:  # legacy "solutions" API
+            results = self.hands.process(rgb)
+            if not results.multi_hand_landmarks:
+                return None
+            def _coords(hand):
+                xs = [lm.x for lm in hand.landmark]
+                ys = [lm.y for lm in hand.landmark]
+                return xs, ys
+            iter_hands = results.multi_hand_landmarks
+
+        # Pick the largest bbox in pixel area.
         best = None
         best_area = -1
-        for hand in results.multi_hand_landmarks:
-            xs = [lm.x for lm in hand.landmark]
-            ys = [lm.y for lm in hand.landmark]
+        for hand in iter_hands:
+            xs, ys = _coords(hand)
             x0 = int(max(0.0, min(xs)) * w)
             y0 = int(max(0.0, min(ys)) * h)
             x1 = int(min(1.0, max(xs)) * w)
