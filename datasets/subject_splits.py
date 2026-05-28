@@ -41,16 +41,19 @@ logger = logging.getLogger(__name__)
 # Subject ID extraction
 # ---------------------------------------------------------------------------
 
-_SUBJECT_RE = re.compile(r"^([A-Z]{2,4})_")
+_SUBJECT_RE = re.compile(r"^([A-Za-z]{2,4})_")
 
 
 def subject_id_from_zip(zip_name: str) -> str:
     """
-    Extract the participant initials from a WiTA zip filename.
+    Extract the participant initials from a WiTA zip filename and return
+    them upper-cased so casing variants ('cyj' vs 'CYJ') collapse to one
+    subject ID.
 
     Examples
     --------
     'CYB_Female_20_eng_freq_word.zip' -> 'CYB'
+    'cyj_Female_25_eng_freq_word.zip' -> 'CYJ'
     'data/HJH_Male_30_eng_non_lex.zip' -> 'HJH'
     """
     base = os.path.basename(zip_name)
@@ -58,9 +61,10 @@ def subject_id_from_zip(zip_name: str) -> str:
     if not m:
         raise ValueError(
             f"Could not extract subject ID from zip name: {zip_name!r}. "
-            "Expected pattern like 'XXX_Female_20_eng_freq_word.zip'."
+            "Expected pattern like 'XXX_Female_20_eng_freq_word.zip' "
+            "(2-4 letters, any case, then underscore)."
         )
-    return m.group(1)
+    return m.group(1).upper()
 
 
 # ---------------------------------------------------------------------------
