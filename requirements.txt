@@ -15,6 +15,11 @@ transformers>=4.40.0
 Pillow>=9.0.0
 numpy>=1.24.0
 
+# ── Hand cropping for V-L pipeline (Path A) ─────────────────
+# Used by datasets/hand_crop.py to localize the writing hand
+# before feeding frames to X-CLIP / SigLIP.
+mediapipe>=0.10.0
+
 # ── String metrics ──────────────────────────────────────────
 editdistance>=0.6.3
 

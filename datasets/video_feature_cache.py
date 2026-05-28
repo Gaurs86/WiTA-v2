@@ -43,18 +43,36 @@ logger = logging.getLogger(__name__)
 # Frame preprocessing for X-CLIP
 # ---------------------------------------------------------------------------
 
+def _resize_pil(img: Image.Image, image_size: int) -> Image.Image:
+    """Ensure PIL image is RGB and (image_size, image_size)."""
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    if img.size != (image_size, image_size):
+        img = img.resize((image_size, image_size), Image.BILINEAR)
+    return img
+
+
 def _pil_to_xclip_tensor(
     img:        Image.Image,
     image_size: int,
 ) -> torch.Tensor:
     """
     PIL → [3, H, W] float32 normalized with X-CLIP stats.
+    Resizes to (image_size, image_size) if needed.
+    """
+    img = _resize_pil(img, image_size)
+    t = TF.to_tensor(img)                # [3, H, W] in [0, 1]
+    return default_normalize(t)
+
+
+def _pil_to_xclip_tensor_no_resize(img: Image.Image) -> torch.Tensor:
+    """
+    PIL → tensor + X-CLIP normalize, WITHOUT resize.  For use after a
+    HandCropper which already resized the cropped frames to target_size.
     """
     if img.mode != "RGB":
         img = img.convert("RGB")
-    if img.size != (image_size, image_size):
-        img = img.resize((image_size, image_size), Image.BILINEAR)
-    t = TF.to_tensor(img)                # [3, H, W] in [0, 1]
+    t = TF.to_tensor(img)
     return default_normalize(t)
 
 
@@ -64,12 +82,13 @@ def _pil_to_xclip_tensor(
 
 @torch.no_grad()
 def extract_xclip_features(
-    samples:    list[tuple[list[bytes], str]],
-    encoder:    XCLIPVideoEncoder,
-    out_path:   str,
-    seg_chunk:  int = 4,
-    device:     str | torch.device = "cuda",
-    dtype:      torch.dtype = torch.float16,
+    samples:      list[tuple[list[bytes], str]],
+    encoder:      XCLIPVideoEncoder,
+    out_path:     str,
+    seg_chunk:    int = 4,
+    device:       str | torch.device = "cuda",
+    dtype:        torch.dtype = torch.float16,
+    hand_cropper = None,
 ) -> dict:
     """
     Extract X-CLIP video features for every clip and save to disk.
@@ -102,6 +121,16 @@ def extract_xclip_features(
     image_size = encoder.image_size
     D          = encoder.out_dim
 
+    # Ensure cropper output size matches what the encoder expects.
+    if hand_cropper is not None:
+        if hand_cropper.target_size != image_size:
+            logger.warning(
+                "hand_cropper.target_size=%d != encoder.image_size=%d; "
+                "overriding cropper target_size to match.",
+                hand_cropper.target_size, image_size,
+            )
+            hand_cropper.target_size = image_size
+
     feats_list:  list[torch.Tensor] = []
     labels_list: list[str]          = []
     lengths:     list[int]          = []
@@ -113,24 +142,30 @@ def extract_xclip_features(
     print(
         f"[video_feature_cache] Encoding {total_clips} clips with "
         f"{encoder.model_name} on {device} (image_size={image_size}, "
-        f"num_frames={encoder.num_frames}, stride={encoder.stride}, dtype={dtype})",
+        f"num_frames={encoder.num_frames}, stride={encoder.stride}, "
+        f"hand_crop={hand_cropper is not None}, dtype={dtype})",
         flush=True,
     )
 
     for ci, (frame_bytes, label) in enumerate(samples):
         try:
-            frames = [
-                _pil_to_xclip_tensor(Image.open(io.BytesIO(b)), image_size)
-                for b in frame_bytes
-            ]
+            pil_frames = [Image.open(io.BytesIO(b)).convert("RGB") for b in frame_bytes]
         except Exception as e:
             logger.warning("Skipping clip %d (decode error): %s", ci, e)
             skipped += 1
             continue
 
-        if not frames:
+        if not pil_frames:
             skipped += 1
             continue
+
+        # Optional hand cropping — same code path used at deployment.
+        # crop_clip returns frames already resized to target_size.
+        if hand_cropper is not None:
+            pil_frames = hand_cropper.crop_clip(pil_frames)
+            frames = [_pil_to_xclip_tensor_no_resize(f) for f in pil_frames]
+        else:
+            frames = [_pil_to_xclip_tensor(f, image_size) for f in pil_frames]
 
         clip = torch.stack(frames, dim=0).to(device, non_blocking=True)  # [T_raw, 3, H, W]
         seg_feats = encoder.encode_clip(
@@ -146,11 +181,15 @@ def extract_xclip_features(
             elapsed = time.time() - t0
             rate    = (ci + 1) / max(elapsed, 1e-3)
             eta     = (total_clips - (ci + 1)) / max(rate, 1e-3)
+            extra   = ""
+            if hand_cropper is not None:
+                s = hand_cropper.stats()
+                extra = f"  hand_det={s['frame_detect_rate']*100:.1f}%"
             print(
                 f"[video_feature_cache] {ci + 1}/{total_clips} clips  "
                 f"({100*(ci+1)/total_clips:5.1f}%)  "
                 f"{rate:.2f} clips/s  ETA {eta/60:5.1f} min  "
-                f"skipped={skipped}",
+                f"skipped={skipped}{extra}",
                 flush=True,
             )
 
@@ -163,7 +202,10 @@ def extract_xclip_features(
         "image_size": image_size,
         "num_frames": encoder.num_frames,
         "stride":     encoder.stride,
+        "hand_crop":  hand_cropper is not None,
     }
+    if hand_cropper is not None:
+        cache["hand_crop_stats"] = hand_cropper.stats()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     torch.save(cache, out_path)
     total_mb = sum(f.numel() * f.element_size() for f in feats_list) / 1e6

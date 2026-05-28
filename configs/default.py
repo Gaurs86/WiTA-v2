@@ -187,6 +187,16 @@ class EncoderConfig:
     xclip_char_template:  str   = "writing the letter {ch} in the air"
     xclip_blank_template: str   = "no writing"
     xclip_sep_template:   str   = "a brief pause between letters"
+
+    # ── Hand-region cropping (Path A) ─────────────────────────────────────
+    # Crops to the writing hand using MediaPipe Hands BEFORE feeding to
+    # X-CLIP.  Concentrates fingertip motion inside the 224×224 input so the
+    # 16×16 patch tokens cover ~7×7 source pixels instead of ~16×16.
+    # Used at both training AND deployment time — same code path either way.
+    enable_hand_crop:        bool  = True
+    hand_crop_padding:       float = 0.3   # extra margin around detected bbox
+    hand_crop_min_conf:      float = 0.3   # MediaPipe detection threshold
+
     # The head fields are shared with SigLIP (siglip_temporal_arch etc.).
 
     # ── SigLIP cross-modal (used when arch == "siglip") ───────────────────
@@ -340,7 +350,10 @@ class TrainConfig:
 
     # ── X-CLIP cached-feature training (cfg.encoder.arch == "xclip") ──────
     # Path to the .pt file produced by datasets/video_feature_cache.py.
-    xclip_feature_cache: Optional[str] = "/kaggle/working/xclip_features.pt"
+    # Default points at the hand-crop variant — set
+    # cfg.encoder.enable_hand_crop=False AND change this path to ablate
+    # without hand cropping.
+    xclip_feature_cache: Optional[str] = "/kaggle/working/xclip_features_handcrop.pt"
 
     seed: int = 42
 
