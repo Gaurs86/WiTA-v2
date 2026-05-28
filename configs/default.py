@@ -181,7 +181,11 @@ class EncoderConfig:
     # head uses X-CLIP text encoder to build per-character prototypes.
     # Unlike per-frame SigLIP, each segment feature encodes MOTION within
     # the 8 frames — this is the fix for the Run-7 mode collapse.
-    xclip_model_name:     str   = "microsoft/xclip-base-patch16-zero-shot"
+    # NOTE: do NOT use the "-zero-shot" variant — its checkpoint expects
+    # num_frames=32, which the encoder auto-bumps to, making feature
+    # extraction ~4× slower with no benefit for our small-adapter training.
+    # patch16 = 14×14 spatial tokens (fine), patch32 = 7×7 (coarse but ~4× faster).
+    xclip_model_name:     str   = "microsoft/xclip-base-patch16"
     xclip_num_frames:     int   = 8       # must match the checkpoint
     xclip_stride:         int   = 4       # sliding-window stride over the raw clip
     xclip_char_template:  str   = "writing the letter {ch} in the air"
@@ -215,10 +219,19 @@ class EncoderConfig:
     siglip_blank_template:  str   = "no character"
     siglip_sep_template:    str   = "a brief pause between letters"
     siglip_temporal_arch:   Literal["lstm", "conv", "transformer", "none"] = "lstm"
-    siglip_adapter_hidden:  int   = 512
+    # 256 (was 512) — full-data ablation on 3129 clips showed train loss
+    # → 0.0003 at hidden=512, indicating ~10× more capacity than data supports.
+    siglip_adapter_hidden:  int   = 256
     siglip_adapter_layers:  int   = 1
+    # NOTE: PyTorch's nn.LSTM ignores `dropout` when num_layers=1. The dropout
+    # field is wired through but only fires for conv/transformer adapters or
+    # when num_layers>=2. Keep at 0.1 as a sane default.
     siglip_dropout:         float = 0.1
-    siglip_init_tau:        float = 0.07
+    # 1.0 (was 0.07): in the L2-normalized similarity setting (commit b78c54c)
+    # cosine sims are in [-1,1], so inv_tau=1.0 keeps logits well-conditioned
+    # at init. init_tau=0.07 → inv_tau≈14 was the cause of the Run-7 mode
+    # collapse before normalization was added.
+    siglip_init_tau:        float = 1.0
     siglip_learnable_tau:   bool  = True
 
     # ── VideoMAE-specific ─────────────────────────────────────────────────
@@ -309,7 +322,10 @@ class TrainConfig:
     # ── Optimiser ─────────────────────────────────────────────────────────
     num_epochs:   int   = 40
     lr:           float = 1e-4      # lower than hybrid (large pretrained backbone)
-    weight_decay: float = 1e-4
+    # 5e-4 (was 1e-4): the cross-modal head heavily overfits the small
+    # WiTA dataset (3129 train clips) at the original 1e-4. Higher weight
+    # decay slows train-loss collapse to 0 and may improve val CER.
+    weight_decay: float = 5e-4
     beta1:        float = 0.90
     # VideoMAE/ViT fine-tuning recipe uses 0.999 (not 0.98).
     beta2:        float = 0.999
