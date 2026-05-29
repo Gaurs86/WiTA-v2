@@ -222,6 +222,56 @@ class ConformerCTC(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def encode(
+        self,
+        x:          torch.Tensor,
+        input_lens: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encoder-only forward — returns the pre-upsample Conformer output.
+        Used by the Stage 1 v3 signer-adversarial head, which needs to
+        branch off the encoder representation (not the CTC log-probs).
+
+        Returns
+        -------
+        h        : [B, T_in, d_model]
+        pad_mask : [B, T_in] bool — True at PAD positions (None if
+                   input_lens is None)
+        """
+        if x.dim() != 3:
+            raise ValueError(f"expected [B, T, D], got {tuple(x.shape)}")
+        B, T_in, _ = x.shape
+        if input_lens is None:
+            input_lens = torch.full((B,), T_in, dtype=torch.long, device=x.device)
+
+        arange = torch.arange(T_in, device=x.device).unsqueeze(0)
+        pad_mask = arange >= input_lens.unsqueeze(1)        # True at pad
+
+        h = self.proj_in(x)
+        for blk in self.blocks:
+            h = blk(h, key_padding_mask=pad_mask)
+        return h, pad_mask
+
+    def decode_ctc(
+        self,
+        h:          torch.Tensor,
+        input_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Decoder-only forward — takes pre-upsample encoder features and
+        produces CTC log-probs.  Lets the trainer share one encoder pass
+        between the CTC objective and the signer-adversarial head.
+        """
+        h = h.transpose(1, 2)                              # [B, d, T_in]
+        h = self.up(h)                                     # [B, d, T_out]
+        h = h.transpose(1, 2)                              # [B, T_out, d]
+        h = self.head_ln(h)
+        logits = self.head_fc(h)
+        log_probs = F.log_softmax(logits, dim=-1)
+        T_out = h.shape[1]
+        enc_lens = (input_lens.long() * self.upsample).clamp(max=T_out)
+        return log_probs, enc_lens.to(torch.int32)
+
     def forward(
         self,
         x:          torch.Tensor,
