@@ -170,3 +170,50 @@ class DINOv2Encoder(nn.Module):
         for i in range(0, T, chunk_size):
             outs.append(self.forward(pixel_values[i : i + chunk_size]))
         return torch.cat(outs, dim=0)
+
+    @torch.no_grad()
+    def forward_patches(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Return PER-PATCH token features (CLS excluded), un-pooled.
+
+        Used by Stage 3 (fingertip-region pooling) and later stages that
+        need spatial conditioning on the token grid.
+
+        pixel_values : [B, 3, H, W]
+        returns      : [B, N_patches, hidden_size]
+                       where N_patches = (H // patch_size) ** 2 = 256 for
+                       dinov2-small at 224×224 (patch14 → 16×16 grid).
+        """
+        if pixel_values.dim() != 4:
+            raise ValueError(
+                f"Expected [B, 3, H, W], got {tuple(pixel_values.shape)}"
+            )
+        out = self.backbone(pixel_values=pixel_values)
+        return out.last_hidden_state[:, 1:]    # drop CLS
+
+    @torch.no_grad()
+    def forward_patches_clip(
+        self,
+        pixel_values: torch.Tensor,
+        chunk_size:   int = 16,
+    ) -> torch.Tensor:
+        """
+        Patch-token version of forward_clip.
+        pixel_values : [T, 3, H, W]
+        returns      : [T, N_patches, D]
+        """
+        T = pixel_values.shape[0]
+        outs: list[torch.Tensor] = []
+        for i in range(0, T, chunk_size):
+            outs.append(self.forward_patches(pixel_values[i : i + chunk_size]))
+        return torch.cat(outs, dim=0)
+
+    @property
+    def patch_size(self) -> int:
+        """Spatial patch size (14 for dinov2-* models)."""
+        return int(self.backbone.config.patch_size)
+
+    @property
+    def grid_size(self) -> int:
+        """Token grid side: image_size // patch_size (16 for 224/14)."""
+        return self.image_size // self.patch_size
