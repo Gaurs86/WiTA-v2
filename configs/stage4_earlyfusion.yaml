@@ -1,0 +1,71 @@
+# configs/stage4_earlyfusion.yaml — Stage 4 early-fusion contract.
+#
+# Single Conformer over concat([landmark, dino]).  See plan §2 Task C.1.
+# Locked optimiser / scheduler / augmentation = Stage 3 (= Stage 1 v2).
+# The only delta vs Stage 3 is the addition of the landmark stream.
+
+fusion_mode:               early
+streams:
+  landmark:
+    cache:                 manifests/landmark_features_t32.pt
+    dim:                   190
+  dino:
+    cache:                 manifests/stage3_features.pt
+    dim:                   1153
+
+model:
+  arch:                    ConformerCTC                 # input_dim = 1343
+  d_model:                 256
+  n_layers:                4
+  n_heads:                 4
+  conv_kernel:             15
+  ff_mult:                 4
+  dropout:                 0.2
+  upsample:                2
+  input_layernorm:         true                         # LN(1343) → Linear
+
+training:
+  num_epochs:              80
+  batch_size:              32
+  optimizer:               AdamW
+  lr_peak:                 5.0e-4
+  weight_decay:            5.0e-2
+  betas:                   [0.9, 0.999]
+  grad_clip:               1.0
+  scheduler:               OneCycleLR
+  warmup_pct:              0.05
+  anneal_strategy:         cos
+  seed:                    42
+  ctc_zero_infinity:       true
+
+augmentation:
+  # Stage 1 v2 temporal augs apply to BOTH streams.  Spatial jitter applies
+  # only to the landmark stream (Stage 1 v2 setup); disabled for the DINOv2
+  # stream because the input is an embedding, not a coordinate.
+  landmark:
+    p_temporal_warp:       0.80
+    temporal_warp_max:     0.15
+    p_spatial_jitter:      0.80
+    spatial_sigma:         0.02
+    p_temporal_crop:       0.50
+    temporal_crop_min:     0.60
+    temporal_crop_max:     1.00
+  dino:
+    p_temporal_warp:       0.80
+    temporal_warp_max:     0.15
+    p_spatial_jitter:      0.0
+    spatial_sigma:         0.0
+    p_temporal_crop:       0.50
+    temporal_crop_min:     0.60
+    temporal_crop_max:     1.00
+
+cv:
+  manifest:                manifests/subject_cv5.json
+  n_folds:                 5
+  seed:                    42
+
+pass_fail:
+  # Plan §2 Task C: mean val CER must beat min(Stage 1 v3, Stage 3) by ≥ 0.03.
+  # Concrete targets (using measured stage1v3 = 0.6448 baseline):
+  headline_val_cer_max:    0.61                          # 0.6448 - 0.03
+  stretch_val_cer_max:     0.55

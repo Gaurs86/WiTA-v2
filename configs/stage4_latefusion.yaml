@@ -1,0 +1,66 @@
+# configs/stage4_latefusion.yaml — Stage 4 late-fusion contract.
+#
+# Two parallel Conformers (d=128 each, 3 layers each), concatenated to a
+# 256-d fused stream, then upsample → head.  See plan §2 Task C.2.
+
+fusion_mode:               late
+streams:
+  landmark:
+    cache:                 manifests/landmark_features_t32.pt
+    dim:                   190
+  dino:
+    cache:                 manifests/stage3_features.pt
+    dim:                   1153
+
+model:
+  arch:                    LateFusionConformerCTC
+  d_per_stream:            128
+  n_layers_per_stream:     3
+  n_heads:                 4
+  conv_kernel:             15
+  ff_mult:                 4
+  dropout:                 0.2
+  upsample:                2
+  # No top-level input_layernorm flag — each per-stream proj_in already has
+  # its own LayerNorm.
+
+training:
+  num_epochs:              80
+  batch_size:              32
+  optimizer:               AdamW
+  lr_peak:                 5.0e-4
+  weight_decay:            5.0e-2
+  betas:                   [0.9, 0.999]
+  grad_clip:               1.0
+  scheduler:               OneCycleLR
+  warmup_pct:              0.05
+  anneal_strategy:         cos
+  seed:                    42
+  ctc_zero_infinity:       true
+
+augmentation:
+  landmark:
+    p_temporal_warp:       0.80
+    temporal_warp_max:     0.15
+    p_spatial_jitter:      0.80
+    spatial_sigma:         0.02
+    p_temporal_crop:       0.50
+    temporal_crop_min:     0.60
+    temporal_crop_max:     1.00
+  dino:
+    p_temporal_warp:       0.80
+    temporal_warp_max:     0.15
+    p_spatial_jitter:      0.0
+    spatial_sigma:         0.0
+    p_temporal_crop:       0.50
+    temporal_crop_min:     0.60
+    temporal_crop_max:     1.00
+
+cv:
+  manifest:                manifests/subject_cv5.json
+  n_folds:                 5
+  seed:                    42
+
+pass_fail:
+  headline_val_cer_max:    0.61
+  stretch_val_cer_max:     0.55

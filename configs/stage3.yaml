@@ -1,0 +1,74 @@
+# configs/stage3.yaml — Stage 3 contract (DINOv2 fingertip pool, headline).
+#
+# Locked from Stage 1 v2 / 1 v3 — every value below was the operating point
+# of the *previous* stage; changing any of them contaminates the Δ-CER
+# attribution per plan §12.  Stage 3 differs from Stage 2 in exactly:
+#   * pooling: mean over all patches  →  bell-weighted 3x3 around fingertip
+#   * input resolution: 224           →  336  (24x24 patch grid)
+#   * temporal context: none          →  ±1 frame concat (3*D channels)
+#   * visibility gate:  off           →  on  (zero context on dropouts, +1 dim)
+# All other knobs match the locked stage1v3 contract.
+
+encoder:
+  name:                  facebook/dinov2-small
+  image_size:            336                  # 336/14 = 24-patch grid
+  pool:                  fingertip_3x3_bell
+  bell_sigma:            1.0
+  temporal_context:      true                 # concat [t-1, t, t+1]
+  visibility_gate:       true                 # zero ctx on dropouts + 1 dim
+
+feature_cache:
+  T_native:              32
+  padding_ratio:         0.3
+  seg_chunk:             16
+  dtype:                 float16
+  # out_dim = 3 * 384 + 1 = 1153 for dinov2-small
+
+model:
+  arch:                  ConformerCTC
+  d_model:               256
+  n_layers:              4
+  n_heads:               4
+  conv_kernel:           15
+  ff_mult:               4
+  dropout:               0.2
+  upsample:              2
+  input_layernorm:       true                 # LN(1153) → Linear(1153,256)
+
+training:
+  num_epochs:            80
+  batch_size:            32
+  optimizer:             AdamW
+  lr_peak:               5.0e-4
+  weight_decay:          5.0e-2
+  betas:                 [0.9, 0.999]
+  grad_clip:             1.0
+  scheduler:             OneCycleLR
+  warmup_pct:            0.05
+  anneal_strategy:       cos
+  seed:                  42
+  ctc_zero_infinity:     true
+
+augmentation:
+  # Same temporal warp + crop-resize as Stage 1 v2.  Spatial jitter is
+  # DISABLED because the input is a DINOv2 patch embedding, not a
+  # coordinate vector.
+  p_temporal_warp:       0.80
+  temporal_warp_max:     0.15
+  p_spatial_jitter:      0.0
+  spatial_sigma:         0.0
+  p_temporal_crop:       0.50
+  temporal_crop_min:     0.60
+  temporal_crop_max:     1.00
+
+cv:
+  manifest:              manifests/subject_cv5.json
+  n_folds:               5
+  seed:                  42
+
+pass_fail:
+  # Each fold must clear train NLL < 0.5 inside `num_epochs`.  If any fold
+  # fails this, abort the sweep — Stage 4 fusion will not save the design.
+  train_nll_must_drop_below: 0.5
+  headline_val_cer_max:      0.860         # beat Stage 2
+  stretch_val_cer_max:       0.78          # makes fusion likely to win

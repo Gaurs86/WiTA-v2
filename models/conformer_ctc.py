@@ -178,17 +178,26 @@ class ConformerCTC(nn.Module):
         ff_mult:    int = 4,
         dropout:    float = 0.1,
         upsample:   int = 2,
+        input_layernorm: bool = False,
     ):
         super().__init__()
         self.input_dim  = input_dim
         self.d_model    = d_model
         self.upsample   = upsample
         self.vocab_size = vocab_size
+        self.input_layernorm = input_layernorm
 
-        self.proj_in = nn.Sequential(
-            nn.Linear(input_dim, d_model),
-            nn.LayerNorm(d_model),
-        )
+        # Pre-projection LayerNorm — used for Stage 3+ where the input is a
+        # DINOv2 patch-pool embedding with very different statistics from
+        # the LSTM-internal landmark features used in Stage 1.  Normalising
+        # the raw input first keeps the downstream linear projection in a
+        # well-behaved regime regardless of input scale.
+        layers: list[nn.Module] = []
+        if input_layernorm:
+            layers.append(nn.LayerNorm(input_dim))
+        layers.append(nn.Linear(input_dim, d_model))
+        layers.append(nn.LayerNorm(d_model))
+        self.proj_in = nn.Sequential(*layers)
 
         self.blocks = nn.ModuleList([
             ConformerBlock(
@@ -213,9 +222,10 @@ class ConformerCTC(nn.Module):
         self.head_fc  = nn.Linear(d_model, vocab_size)
 
         logger.info(
-            "[ConformerCTC] in=%d d=%d L=%d heads=%d kernel=%d upsample=%d V=%d",
+            "[ConformerCTC] in=%d d=%d L=%d heads=%d kernel=%d upsample=%d "
+            "V=%d input_layernorm=%s",
             input_dim, d_model, n_layers, n_heads, conv_kernel, upsample,
-            vocab_size,
+            vocab_size, input_layernorm,
         )
 
     @property
