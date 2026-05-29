@@ -36,6 +36,14 @@ import logging
 import os
 import sys
 
+# Make the `wita_v2` package importable when this script is invoked from
+# a fresh `python` subprocess (e.g. !python ... inside a Kaggle notebook).
+# The notebook's own sys.path is NOT inherited by subprocesses.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PACKAGE_PARENT = os.path.dirname(os.path.dirname(_HERE))  # /kaggle/working
+if _PACKAGE_PARENT not in sys.path:
+    sys.path.insert(0, _PACKAGE_PARENT)
+
 import numpy as np
 import torch
 import torch.nn as nn
