@@ -301,6 +301,8 @@ def extract_skeleton_features(
     out_path:   str,
     T_native:   int = 32,
     dtype:      torch.dtype = torch.float16,
+    extractor=None,
+    backend_name: str | None = None,
 ) -> dict:
     """
     Build a skeleton feature cache.
@@ -311,10 +313,19 @@ def extract_skeleton_features(
               `subject_splits.stream_and_index_with_subjects`.
     out_path : where to save the .pt cache.
     T_native : uniform sequence length to resample every clip to.
+    extractor : optional pluggable keypoint detector with the same
+                `.detect(pil_image) -> [21, 3] | None` interface as
+                `LandmarkExtractor`.  Used by the HRNet-swap experiment
+                so the EXACT same feature pipeline runs over alternative
+                keypoint backends.  Defaults to LandmarkExtractor().
+    backend_name : optional string stamped into the cache for provenance.
 
     Returns the same dict that was written to disk.
     """
-    extractor = LandmarkExtractor()
+    own_extractor = False
+    if extractor is None:
+        extractor = LandmarkExtractor()
+        own_extractor = True
     feats_list:    list[torch.Tensor] = []
     labels_list:   list[str]          = []
     subjects_list: list[str]          = []
@@ -373,7 +384,8 @@ def extract_skeleton_features(
                 flush=True,
             )
 
-    extractor.close()
+    if own_extractor:
+        extractor.close()
 
     cache = {
         "feats":      feats_list,
@@ -384,6 +396,7 @@ def extract_skeleton_features(
         "n_native":   T_native,
         "frame_detect_rate":
             n_detected_total / max(n_frames_total, 1),
+        "backend":    backend_name or "mediapipe_default",
     }
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     torch.save(cache, out_path)
