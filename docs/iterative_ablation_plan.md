@@ -6,7 +6,8 @@ new collaborators (and future-me) can read one file instead of stitching
 together prompts and notebooks.  Update it whenever a stage's verdict
 lands.
 
-Last updated: **after Stage 1 v3** (DANN falsified, 5-fold CV protocol locked).
+Last updated: **after HRNet hand-keypoint swap experiment** (null verdict; PHW
+and KIM accepted as dataset-side limits; dual-cohort reporting locked in).
 
 ---
 
@@ -30,13 +31,14 @@ Last updated: **after Stage 1 v3** (DANN falsified, 5-fold CV protocol locked).
 
 ## 1. Stage status
 
-| Stage | Description                                            | Status      | 5-fold mean ± std | Notes |
-|-------|--------------------------------------------------------|-------------|--------------------|-------|
-| 1 v1  | Landmarks, no augment, 200 epochs                      | superseded  | —                  | single-split 0.7060; collapsed train NLL |
-| 1 v2  | + augmentation (temporal warp/jitter/crop) + dropout/wd | superseded  | —                  | single-split 0.6870 |
-| **1 v3** | Stage 1 v2 + DANN signer-adversarial (3 alpha × 5 folds) | **complete** | **0.6448 ± 0.052** (no_dann) | DANN falsified |
-| 2     | DINOv2-S mean-pool over all 256 patches                | complete    | *(single-split)* 0.8601 | mean-pool destroys spatial focus |
-| 3     | DINOv2-S **fingertip 3x3 bell pool** + ±1 temporal context + visibility gate | **in progress** | target 0.70–0.78 | see `configs/stage3.yaml` |
+| Stage | Description                                            | Status      | Full-cohort 5-fold | PHW/KIM-stripped | Notes |
+|-------|--------------------------------------------------------|-------------|--------------------|------------------|-------|
+| 1 v1  | Landmarks, no augment, 200 epochs                      | superseded  | —                  | —                | single-split 0.7060; collapsed train NLL |
+| 1 v2  | + augmentation (temporal warp/jitter/crop) + dropout/wd | superseded  | —                  | —                | single-split 0.6870 |
+| **1 v3** | Stage 1 v2 + DANN signer-adversarial (3 alpha × 5 folds) | **complete** | **0.6448 ± 0.052** (no_dann) | **0.6383 ± 0.0445** | DANN falsified |
+| HRNet swap | PHW+KIM keypoint backend test (no retrain)        | **complete** | n/a                | n/a              | verdict `null`; PHW+KIM = dataset-side limit |
+| 2     | DINOv2-S mean-pool over all 256 patches                | complete    | *(single-split)* 0.8601 | —          | mean-pool destroys spatial focus |
+| 3     | DINOv2-S **fingertip 3x3 bell pool** + ±1 temporal context + visibility gate | **in progress** | target 0.70–0.78 | target 0.69–0.77 | see `configs/stage3.yaml` |
 | 3 mj  | Stage 3 ablation: 5-fingertip pool                     | pending     | —                  | `configs/stage3_multijoint.yaml` |
 | 4     | Fusion: landmark stream + DINOv2 fingertip stream      | pending     | target 0.46–0.58 | early & late variants |
 | 5     | Swin-T + landmarks                                     | pending     | prior 0.58–0.65 |   |
@@ -63,26 +65,51 @@ Last updated: **after Stage 1 v3** (DANN falsified, 5-fold CV protocol locked).
   Mean-pool destroys spatial focus on the writing region.  Stage 3 fixes
   this by pooling the bell-weighted 3x3 patch window around the fingertip.
 
+### From the tracker-quality audit (Task A)
+- Verdict `tracker_partial` (Pearson r=-0.40 visibility / +0.34 dropout-length).
+  Two signers — **PHW (vis 0.716, CER 0.898) and KIM (vis 0.738, CER 0.723)** —
+  are the only ones below 90% MediaPipe visibility.  All six other hard-regime
+  signers have ≥ 98% visibility, so their high CER is not tracker-driven.
+
+### From the HRNet hand-keypoint swap experiment
+- **Verdict `null`.**  Swapping MediaPipe for sensitive-MediaPipe on PHW+KIM
+  clips (180 clips total) improved detection from 78.1% → 81.3% but cut
+  CER by only +1.1 pp on each signer (PHW 0.8493 → 0.8387; KIM 0.7435 → 0.7323).
+  Yield ratio ~0.33 CER pp per 1 pp of detection — well below the >1.0 you'd
+  see if the tracker were genuinely the bottleneck.
+- **Decision**: PHW and KIM are accepted as a **dataset-side limit** (motion blur,
+  lighting, or hand off-frame on these two specific captures).  Do not swap
+  the keypoint backend.  All future stage reports emit **dual-cohort numbers**:
+  a full-cohort 5-fold mean AND a PHW/KIM-stripped 5-fold mean.  The
+  stripped number isolates model-side progress from the dataset floor.
+- RTMPose backend was prepared but not run (mmpose install failed on Kaggle).
+  Re-running it would require a > 10 pp CER improvement on PHW+KIM to flip
+  the verdict — an order of magnitude beyond what sensitive MediaPipe achieved.
+
 ---
 
 ## 3. Hard-regime tail (per-signer floor)
 
-Eight signers (PHW, PJH, SYB, KJM, KNY, LKS, KIM, YMG) sit at CER 0.72–0.90 and
-are **near-invariant to model interventions** in Stage 1 v3 across the three
-DANN variants (PHW: 0.898 / 0.853 / 0.851).  This pattern strongly suggests
-the residual is a **feature / tracker-quality floor**, not a modelling deficit.
+The Stage 1 v3 no_dann 5-fold no_dann sweep produced a bimodal per-signer
+CER distribution with eight hard-regime signers above 0.72.  After the
+HRNet-swap experiment they split into two distinct sub-groups:
 
-**Planned mitigations** (only if the Task A audit confirms tracker drift drives the tail):
-1. Swap MediaPipe HandLandmarker for HRNet hand keypoints (offline pre-compute).
-2. Keep the visibility-gate dim in Stage 3+ inputs so the Conformer can attenuate
-   dropout frames rather than treat them as real content.
-3. Inspect overlay GIFs for the worst signers; if trajectories look genuinely
-   ambiguous (not tracker error), the residual is genuine handwriting hardness
-   and is not addressable from the model side at this scale.
+| Sub-group | Signers | Behaviour |
+|---|---|---|
+| Dataset-side limit | PHW, KIM | Low MediaPipe visibility (<75%); tracker swap doesn't help (verdict null).  Floor likely sits around current CER. |
+| Model-side hard regime | PJH, SYB, KJM, KNY, LKS, YMG | ≥ 98% visibility; high CER comes from genuine handwriting ambiguity or feature-deficit, not tracker.  Stage 3+ designs may still help. |
 
-The audit driver lives in `scripts/audit_tracker_quality.py`.  Run with
-`--mode cache` for a fast pass, or `--mode reextract` for the full audit with
-overlay GIFs and native-resolution per-frame metrics.
+**Operating decision on the dataset-side group**:
+- Report dual-cohort numbers from Stage 3 onwards (`reports/template/stripped_cohort.py`
+  computes both means from any results JSON).
+- Stage 1 v3 dual-cohort baseline (no_dann):
+  - **Full cohort**: 0.6448 ± 0.052
+  - **PHW/KIM-stripped**: **0.6383 ± 0.0445**  (Δ = +0.0065)
+- The stripped baseline is what Stage 3+ must beat in addition to the full one.
+
+The audit driver lives in `scripts/audit_tracker_quality.py`.  The HRNet-swap
+experiment lives in `scripts/extract_phw_kim_keypoints.py` + `scripts/eval_phw_kim_hrnet.py`
++ `notebooks/run_hrnet_swap_kaggle.ipynb`.
 
 ---
 
@@ -143,18 +170,25 @@ Augmentation (`LandmarkAugment` defaults):
 
 ---
 
-## 6. Reporting protocol (per Task D)
+## 6. Reporting protocol (per Task D, amended after HRNet swap)
 
 Every stage's report directory (`reports/stageN/`) must contain:
 1. `stageN_report.md` — narrative + headline table.
-2. `per_signer_cer.csv` (39 rows) + scatter PNG generated via
+2. **Dual-cohort summary** (`reports/template/stripped_cohort.py`):
+   - full-cohort 5-fold mean ± std
+   - PHW/KIM-stripped 5-fold mean ± std
+   - Δ between them
+   Both numbers go in the headline table; the stripped one is the
+   model-side progress indicator, the full one is the literature-comparable
+   headline.
+3. `per_signer_cer.csv` (39 rows) + scatter PNG generated via
    `reports/template/per_signer_scatter.py`.
-3. CV aggregate (mean ± std) printed via `reports/template/cv_summary.py`
+4. CV aggregate (mean ± std) printed via `reports/template/cv_summary.py`
    with a paired Wilcoxon against the previous-stage baseline.
-4. The Stage-0 diagnostic suite snapshot
+5. The Stage-0 diagnostic suite snapshot
    (`length-bucketed CER`, `NLL gap`, `blank prob`, `KL(pred‖label)`,
    `edit decomposition`).
-5. Train CTC loss curve overlaid against Stage 1 v2 and Stage 2 (same axis
+6. Train CTC loss curve overlaid against Stage 1 v2 and Stage 2 (same axis
    as the original Stage 1/2 report).
 
 For amendments to historical reports (Stage 1 v1 → v3, Stage 2), use the
