@@ -6,8 +6,10 @@ new collaborators (and future-me) can read one file instead of stitching
 together prompts and notebooks.  Update it whenever a stage's verdict
 lands.
 
-Last updated: **after HRNet hand-keypoint swap experiment** (null verdict; PHW
-and KIM accepted as dataset-side limits; dual-cohort reporting locked in).
+Last updated: **after Stage 3 sweep** (DINOv2 fingertip-pool design FAILED
+the gating test on 4/5 folds; lost to Stage 1 v3 by +0.16 CER/fold).
+Frozen-appearance features confirmed insufficient for the kinematic task;
+Stage 4 fusion proposed only as a low-cost sanity check.
 
 ---
 
@@ -38,9 +40,9 @@ and KIM accepted as dataset-side limits; dual-cohort reporting locked in).
 | **1 v3** | Stage 1 v2 + DANN signer-adversarial (3 alpha × 5 folds) | **complete** | **0.6448 ± 0.052** (no_dann) | **0.6383 ± 0.0445** | DANN falsified |
 | HRNet swap | PHW+KIM keypoint backend test (no retrain)        | **complete** | n/a                | n/a              | verdict `null`; PHW+KIM = dataset-side limit |
 | 2     | DINOv2-S mean-pool over all 256 patches                | complete    | *(single-split)* 0.8601 | —          | mean-pool destroys spatial focus |
-| 3     | DINOv2-S **fingertip 3x3 bell pool** + ±1 temporal context + visibility gate | **in progress** | target 0.70–0.78 | target 0.69–0.77 | see `configs/stage3.yaml` |
-| 3 mj  | Stage 3 ablation: 5-fingertip pool                     | pending     | —                  | `configs/stage3_multijoint.yaml` |
-| 4     | Fusion: landmark stream + DINOv2 fingertip stream      | pending     | target 0.46–0.58 | early & late variants |
+| **3** | DINOv2-S **fingertip 3x3 bell pool** + ±1 temporal context + visibility gate | **complete (fail)** | **0.8045 ± 0.020** | **0.8020 ± 0.017** | ❌ gating failed 4/5 folds; loses to Stage 1 v3 by +0.16 CER/fold |
+| 3 mj  | Stage 3 ablation: 5-fingertip pool                     | deprioritised | —                  | —                | likely same failure mode; only run if Stage 4 confirms structural deficit |
+| 4     | Fusion: landmark stream + DINOv2 fingertip stream      | next (sanity check) | target ≤ 0.638 (match Stage 1 v3 stripped) | target ≤ 0.628 (Stage 1 v3 stripped − 0.01) | downgraded from "beat by 0.03" |
 | 5     | Swin-T + landmarks                                     | pending     | prior 0.58–0.65 |   |
 | 6     | VideoMAE + landmarks                                   | pending     | prior 0.55–0.63 |   |
 | 7     | CLIP/SigLIP + landmarks                                | pending     | prior 0.57–0.64 |   |
@@ -85,6 +87,29 @@ and KIM accepted as dataset-side limits; dual-cohort reporting locked in).
 - RTMPose backend was prepared but not run (mmpose install failed on Kaggle).
   Re-running it would require a > 10 pp CER improvement on PHW+KIM to flip
   the verdict — an order of magnitude beyond what sensitive MediaPipe achieved.
+
+### From Stage 3 (DINOv2 fingertip pool, 5-fold CV)
+- **Result**: full cohort 0.8045 ± 0.020, PHW/KIM-stripped 0.8020 ± 0.017.
+  Beats Stage 2 mean (0.860) but loses to Stage 1 v3 (0.6448) by +0.16 CER
+  on every single fold (paired Wilcoxon W=0, p=0.0625).
+- **Gating test failed on 4 of 5 folds.**  Train NLL stalled at 0.52–0.59,
+  never reaching the 0.5 threshold required for the head to demonstrate it
+  can fit the data.  Only fold 0 marginally cleared the gate.  Best val
+  epoch was 20–32 of 80 — the model hits its representational ceiling
+  before half the budget is spent.
+- **Diagnosis**: frozen DINOv2 appearance features at the fingertip location
+  encode skin / nail / finger pose / lighting — not the *trajectory* the
+  letter is encoded in.  Air-writing is a kinematic task; landmark
+  coordinates (which natively encode position-over-time + first/second
+  differences) are the right representation.  Stage 3 actually regressed
+  the EASY signers (KIS 0.43 → 0.78, YJH 0.44 → 0.71), confirming this
+  isn't a hard-tail problem — the feature is wrong for the whole task.
+- **Operational implication**: do not run Stage 3 multi-joint (likely same
+  failure mode).  Frozen-V-L pipelines downstream (Stages 5–8) should be
+  expected to underperform landmarks; treat them as ablations to confirm
+  the pattern rather than as candidate winners.  Stage 4 fusion is run
+  only as a cheap sanity check — its threshold downgraded from
+  "beat Stage 1 v3 by 0.03" to "match Stage 1 v3 stripped within 0.01".
 
 ---
 
@@ -143,20 +168,32 @@ Augmentation (`LandmarkAugment` defaults):
 
 ## 5. Pass/fail thresholds per stage
 
-### Stage 3 (DINOv2 fingertip + temporal context + visibility gate)
-- **Gating test**: every fold must reach `train NLL < 0.5` within 80 epochs.
-  If any fold fails, the design is feature-insufficient — Stage 4 fusion
-  will not save it.  Abort and audit MediaPipe + the patch pool.
-- **Headline**: mean val CER ≤ **0.860** (beat Stage 2 mean).
-- **Stretch**:  mean val CER ≤ **0.78** (Stage 4 fusion likely clears 0.55).
+### Stage 3 (DINOv2 fingertip + temporal context + visibility gate) — RESULT
+- **Gating test**: train NLL must drop < 0.5 on every fold.  **Failed
+  4 / 5 folds** (final NLLs 0.52, 0.55, 0.59, 0.54, 0.55).  Only fold 0
+  marginally cleared at 0.518.
+- **Full headline**: mean 0.8045 — clears 0.860 (beats Stage 2) but
+  loses to Stage 1 v3 (0.6448) by +0.16 / fold.
+- **Stripped**: 0.8020 ± 0.017 — ~0.16 worse than Stage 1 v3 stripped
+  (0.6383).
+- Conclusion: frozen DINOv2 appearance features lack the trajectory
+  signal this kinematic task needs.  See `reports/stage3/report.md`.
 
-### Stage 4 (early- or late-fusion)
-- **Headline**: mean val CER ≤ min(Stage 1 v3, Stage 3) − **0.03**.  With
-  current measured baselines that's ≤ **0.61**.
-- If neither fusion design clears the threshold, the two streams are
-  mutually redundant; pick the cheaper.
+### Stage 4 (early- or late-fusion) — DOWNGRADED THRESHOLD
+- Pre-Stage-3, target was mean val CER ≤ min(Stage 1 v3, Stage 3) − 0.03.
+  With Stage 3 collapsed at 0.8045, that's just (Stage 1 v3 − 0.03) ≈ 0.61.
+- Given Stage 3's gating failure, Stage 4 fusion is now run as a
+  **sanity check**, not as a winner candidate.  Pass criteria:
+    - **Match Stage 1 v3 stripped** (≤ 0.6383, full cohort) → confirms
+      late-fusion landmark stream can recover Stage 1 v3 level despite
+      noisy DINOv2 stream.
+    - **Beat Stage 1 v3 stripped by ≥ 0.01** (≤ 0.628) → marginal
+      complementarity; publishable but no longer the headline path.
+- If neither fusion design matches Stage 1 v3, the conclusion is that
+  the DINOv2 stream actively poisons training (gradient coupling under
+  concatenation, or distributional mismatch).  Worth reporting.
 - If late ≫ early, the streams are gradient-coupled badly under
-  concatenation — interesting and worth reporting.
+  concatenation.  Late-fusion is the design that survives.
 
 ### Stages 5–8 (Swin-T, VideoMAE, CLIP/SigLIP, X-CLIP + landmarks)
 - Each must beat **Stage 4 mean** to enter row-4-winner contention.
