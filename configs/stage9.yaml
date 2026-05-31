@@ -1,0 +1,65 @@
+# configs/stage9.yaml — Stage 9a (joint CTC + attention) on landmarks.
+#
+# Locked encoder + optimiser + scheduler + augmentation = Stage 1 v2.
+# New variable: attention decoder + joint loss.  Stage 9b (KenLM rescoring)
+# uses the same checkpoint, no retraining.
+
+encoder:
+  feature_cache:           skeleton_features_t32.pt   # Stage 1 landmark cache
+  in_dim:                  190
+  arch:                    ConformerCTC               # encoder unchanged
+  d_model:                 256
+  n_layers:                4
+  n_heads:                 4
+  conv_kernel:             15
+  ff_mult:                 4
+  dropout:                 0.2
+  upsample:                2
+  input_layernorm:         false                      # landmarks, S1v2 contract
+
+decoder:
+  arch:                    AttentionDecoder
+  n_layers:                3
+  n_heads:                 4
+  ff_mult:                 4
+  dropout:                 0.2
+  max_decode_len:          64                          # well above any WiTA label
+
+loss:
+  type:                    joint_ctc_attn
+  lambda_ctc:              0.3                         # ESPnet convention
+  ctc_zero_infinity:       true
+
+training:
+  num_epochs:              80
+  batch_size:              32
+  optimizer:               AdamW
+  lr_peak:                 5.0e-4
+  weight_decay:            5.0e-2
+  betas:                   [0.9, 0.999]
+  grad_clip:               1.0
+  scheduler:               OneCycleLR
+  warmup_pct:              0.05
+  anneal_strategy:         cos
+  seed:                    42
+
+augmentation:
+  # Stage 1 v2 defaults (LandmarkAugment) — landmarks support full spatial+temporal.
+  p_temporal_warp:         0.80
+  temporal_warp_max:       0.15
+  p_spatial_jitter:        0.80
+  spatial_sigma:           0.02
+  p_temporal_crop:         0.50
+  temporal_crop_min:       0.60
+  temporal_crop_max:       1.00
+
+cv:
+  manifest:                manifests/subject_cv5.json
+  n_folds:                 5
+  seed:                    42
+
+pass_fail:
+  # Stage 1 v3 no_dann stripped baseline = 0.6383.  Stage 9 should improve
+  # decoding-side modelling, so the headline target shaves ≥ 5 pts off:
+  headline_val_cer_max:    0.59
+  stretch_val_cer_max:     0.53
