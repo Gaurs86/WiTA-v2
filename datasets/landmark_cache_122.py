@@ -202,6 +202,155 @@ def extract_zip_per_clip_landmarks(
     }
 
 
+def extract_dir_per_clip_landmarks(
+    dir_path:        str,
+    out_dir:         str,
+    split:           str,
+    subset:          str,
+    *,
+    lang:            str = "english",
+    max_frames:      int = 64,
+    T_native:        int = 32,
+    extractor:       LandmarkExtractor | None = None,
+    overwrite:       bool = False,
+    log_every:       int = 100,
+) -> dict:
+    """
+    Same as `extract_zip_per_clip_landmarks` but reads from a directory
+    that's already been extracted (Kaggle auto-unpacks .zip datasets at
+    mount time).  The directory is expected to contain per-signer
+    subdirectories with `gt.txt` and per-clip numbered subfolders of
+    frames -- the same layout the HF zips have.
+    """
+    from PIL import Image
+    import io
+
+    assert split  in {"train", "val", "test"}, split
+    assert subset in {"lex", "nonlex"}, subset
+
+    out_subset = Path(out_dir) / split / subset
+    out_subset.mkdir(parents=True, exist_ok=True)
+
+    own_extractor = False
+    if extractor is None:
+        extractor = LandmarkExtractor()
+        own_extractor = True
+
+    n_total = n_written = n_skipped = n_existing = 0
+    detect_frames_total = detect_frames_detected = 0
+    seen_signers: set[str] = set()
+
+    dir_path = Path(dir_path)
+    logger.info("[landmark_cache_122] processing dir %s -> %s/%s",
+                dir_path, split, subset)
+
+    # Walk for every gt.txt under dir_path.
+    gt_files = sorted(dir_path.rglob("gt.txt"))
+    logger.info("  found %d gt.txt files (per-signer subdirs)", len(gt_files))
+
+    for gi, gt_full in enumerate(gt_files):
+        parent_dir = gt_full.parent
+        parent_rel = str(parent_dir.relative_to(dir_path))
+        try:
+            signer_id = _signer_id_from_parent(parent_rel)
+        except ValueError as e:
+            logger.warning("  skip %s: %s", parent_rel, e)
+            continue
+        seen_signers.add(signer_id)
+
+        # Parse labels (text lines).  English filter mirrors _parse_gt.
+        try:
+            with open(gt_full, "r", encoding="utf-8", errors="replace") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            labels = lines           # one per clip subdir
+        except Exception as e:
+            logger.warning("  could not read %s: %s", gt_full, e)
+            continue
+
+        for clip_idx, label in enumerate(labels):
+            n_total += 1
+            clip_id = _safe_clip_id(parent_rel, clip_idx)
+            out_npz = out_subset / f"{signer_id}__{clip_id}.npz"
+            if out_npz.exists() and not overwrite:
+                n_existing += 1
+                continue
+
+            clip_dir = parent_dir / str(clip_idx)
+            if not clip_dir.is_dir():
+                n_skipped += 1
+                continue
+
+            # Read frame bytes (jpegs sorted).
+            frame_paths = sorted(
+                [p for p in clip_dir.iterdir()
+                 if p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+            )
+            if max_frames and len(frame_paths) > max_frames:
+                # Uniform-subsample like _read_frames_from_zip.
+                idx = np.linspace(0, len(frame_paths) - 1, max_frames).round().astype(int)
+                frame_paths = [frame_paths[int(i)] for i in idx]
+            if not frame_paths:
+                n_skipped += 1
+                continue
+            frames = [p.read_bytes() for p in frame_paths]
+
+            try:
+                feats, stats = build_clip_features(
+                    frames, extractor, T_native=T_native,
+                )
+            except Exception as e:
+                logger.warning("  clip %s failed: %s", clip_id, e)
+                n_skipped += 1
+                continue
+
+            detect_frames_total    += stats["n_frames_seen"]
+            detect_frames_detected += stats["n_frames_detected"]
+
+            np.savez_compressed(
+                out_npz,
+                feature=feats.astype(np.float16),
+                label=label,
+                signer=signer_id,
+                subset=subset,
+                clip_id=clip_id,
+                detected=np.float32(stats["detect_rate"]),
+            )
+            n_written += 1
+
+            if (n_total) % log_every == 0:
+                print(
+                    f"  [{split}/{subset}] {n_total} clips  "
+                    f"(written {n_written}, existing {n_existing}, "
+                    f"skipped {n_skipped})  "
+                    f"detect={detect_frames_detected / max(detect_frames_total, 1) * 100:.1f}%",
+                    flush=True,
+                )
+
+    if own_extractor:
+        extractor.close()
+
+    print(
+        f"[landmark_cache_122] done  {split}/{subset}:  total={n_total}  "
+        f"written={n_written}  reused={n_existing}  skipped={n_skipped}  "
+        f"signers={len(seen_signers)}  "
+        f"detect_rate={detect_frames_detected / max(detect_frames_total, 1) * 100:.2f}%",
+        flush=True,
+    )
+    return {
+        "split":             split,
+        "subset":            subset,
+        "n_total":           n_total,
+        "n_written":         n_written,
+        "n_existing":        n_existing,
+        "n_skipped":         n_skipped,
+        "n_signers":         len(seen_signers),
+        "signers":           sorted(seen_signers),
+        "detect_rate":       detect_frames_detected / max(detect_frames_total, 1),
+        "frames_detected":   detect_frames_detected,
+        "frames_total":      detect_frames_total,
+    }
+
+
 def extract_temp_then_process(
     zip_path:        str,
     out_dir:         str,
