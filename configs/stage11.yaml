@@ -1,0 +1,89 @@
+# configs/stage11.yaml — paper-comparable headline run on the full 122-signer
+# WiTA English dataset under the paper's 8:1:1 person-split.
+#
+# Hyperparameters are FROZEN from the Stage 9a-best ablation winners.  The
+# ONLY variable changing from Stage 9a-v3 is the data (122 signers under
+# the paper split, vs 38 signers under 5-fold CV).  See §7 of the
+# Stage 11 prompt for the reproducibility contract.
+
+stage: stage11_paper_split_122signers
+seed:  42
+
+data:
+  cache_root: /kaggle/input/wita-full-english-landmark-cache/landmark_cache_122
+  splits:
+    train: train
+    val:   val
+    test:  test
+  subsets: [lex, nonlex]
+  lang:    english
+  T_native: 32
+  input_dim: 190                 # 21 joints × 3 + vel + acc + visibility
+
+model:
+  encoder:
+    arch:        ConformerCTC
+    in_dim:      190
+    d_model:     256
+    n_layers:    4
+    n_heads:     4
+    conv_kernel: 15
+    ff_mult:     4
+    dropout:     0.2
+    upsample:    2                # T_out = 64
+    input_layernorm: false        # landmarks, Stage 1 v2 contract
+  decoder:
+    arch:        AttentionDecoder
+    n_layers:    2                # Stage 9a ablation winner
+    d_model:     256
+    n_heads:     4
+    ff_mult:     4
+    dropout:     0.2
+
+loss:
+  lambda_ctc:     0.5             # Stage 9a ablation winner
+  ctc_zero_infinity: true
+  label_smoothing: 0.1            # attention CE only
+
+augmentation:
+  # LandmarkAugment defaults — Stage 1 v2 contract.  Train only.
+  p_temporal_warp:    0.80
+  temporal_warp_max:  0.15
+  p_spatial_jitter:   0.80
+  spatial_sigma:      0.02
+  p_temporal_crop:    0.50
+  temporal_crop_min:  0.60
+  temporal_crop_max:  1.00
+
+training:
+  num_epochs:       80
+  batch_size:       32
+  optimizer:        AdamW
+  lr_peak:          5.0e-4
+  weight_decay:     5.0e-2
+  betas:            [0.9, 0.999]
+  grad_clip:        1.0
+  scheduler:        OneCycleLR
+  warmup_pct:       0.05
+  anneal_strategy:  cos
+  num_workers:      2
+
+checkpoint:
+  selection_metric: val_overall_cer
+  selection_mode:   min
+
+test:
+  evaluate_once:    true          # marker file gates re-runs
+  subsets:          [lex, nonlex]
+
+paper_baseline:
+  source:   "Kim et al. 2023"
+  overall:  0.2924
+  lex:      0.281
+  nonlex:   0.365
+
+pass_fail_bands:
+  strong_pass:    {test_overall_cer_max: 0.29, test_lex_cer_max: 0.27}
+  pass_on_lex:    {test_overall_cer_max: 0.32, test_lex_cer_max: 0.27}
+  competitive:    {test_overall_cer_max: 0.35, test_lex_cer_max: 0.30}
+  underperforms:  {test_overall_cer_min: 0.35}
