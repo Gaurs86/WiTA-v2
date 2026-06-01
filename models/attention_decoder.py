@@ -4,17 +4,25 @@ models/attention_decoder.py — Transformer attention decoder for Stage 9.
 Pairs with the Conformer encoder under joint CTC + attention training.
 Same d_model as the encoder (256), but its own self+cross attention.
 
-Vocab convention
-----------------
-The label space adds two special tokens to the CTC character set:
-    BOS = ctc_vocab_size       (start-of-sequence; never emitted)
-    EOS = ctc_vocab_size + 1   (end-of-sequence sentinel)
-Attention vocab size = ctc_vocab_size + 2.
+Vocab convention (uses the project's existing VocabConfig)
+----------------------------------------------------------
+The label space already reserves four special tokens after the character
+indices in configs/default.py::VocabConfig:
+    blank_idx        = 0
+    chars            = 1 .. N     (e.g. a..z for English, N=26)
+    sep_idx          = N + 1      (CTC repeat separator)
+    sos_idx          = N + 2      (BOS for attention)
+    eos_idx          = N + 3      (EOS for attention)
+    pad_idx          = N + 4      (CE ignore_index)
+    attn_vocab_size  = N + 5      (embedding size)
+The attention decoder MUST be sized to attn_vocab_size so pad_idx fits.
+An earlier version used ctc_vocab_size + 2 = N + 4, which made pad_idx
+(N+4) out-of-range and crashed with a CUDA gather-kernel assertion.
 
 Training is teacher-forced:
-    decoder input :  [BOS, c_1, c_2, ..., c_N]
+    decoder input :  [SOS, c_1, c_2, ..., c_N]
     decoder target:  [c_1, c_2, ..., c_N, EOS]
-CrossEntropyLoss with ignore_index=PAD over the shifted target.
+CrossEntropyLoss with ignore_index=pad_idx over the shifted target.
 
 Greedy inference walks the decoder one step at a time until EOS or
 `max_decode_len` (defaults to 2 × T_encoder, well above any WiTA label).
@@ -122,12 +130,20 @@ class _DecoderBlock(nn.Module):
 class AttentionDecoder(nn.Module):
     """
     N-layer Transformer attention decoder.  Same d_model as the encoder.
-    Outputs logits over the attention-vocab (CTC vocab + BOS + EOS).
+    Outputs logits over the project's attn_vocab (configs/default.py::VocabConfig).
+
+    Parameters
+    ----------
+    att_vocab_size : full attention vocab size, i.e. cfg.vocab.attn_vocab_size
+    bos_idx        : SOS token, i.e. cfg.vocab.sos_idx
+    eos_idx        : EOS token, i.e. cfg.vocab.eos_idx
     """
 
     def __init__(
         self,
-        ctc_vocab_size: int,
+        att_vocab_size: int,
+        bos_idx:        int,
+        eos_idx:        int,
         d_model:        int = 256,
         n_layers:       int = 3,
         n_heads:        int = 4,
@@ -136,10 +152,14 @@ class AttentionDecoder(nn.Module):
         max_decode_len: int = 64,
     ):
         super().__init__()
-        self.ctc_vocab_size = ctc_vocab_size
-        self.bos = ctc_vocab_size
-        self.eos = ctc_vocab_size + 1
-        self.att_vocab_size = ctc_vocab_size + 2
+        if not (0 <= bos_idx < att_vocab_size) or not (0 <= eos_idx < att_vocab_size):
+            raise ValueError(
+                f"BOS / EOS indices must be in [0, att_vocab_size).  "
+                f"Got bos={bos_idx}, eos={eos_idx}, att_vocab_size={att_vocab_size}."
+            )
+        self.att_vocab_size = att_vocab_size
+        self.bos            = bos_idx
+        self.eos            = eos_idx
         self.d_model        = d_model
         self.max_decode_len = max_decode_len
 
@@ -153,8 +173,8 @@ class AttentionDecoder(nn.Module):
         self.head   = nn.Linear(d_model, self.att_vocab_size)
 
         logger.info(
-            "[AttentionDecoder] ctc_V=%d att_V=%d d=%d L=%d heads=%d",
-            ctc_vocab_size, self.att_vocab_size, d_model, n_layers, n_heads,
+            "[AttentionDecoder] att_V=%d bos=%d eos=%d d=%d L=%d heads=%d",
+            att_vocab_size, bos_idx, eos_idx, d_model, n_layers, n_heads,
         )
 
     @property

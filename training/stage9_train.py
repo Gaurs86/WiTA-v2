@@ -137,9 +137,19 @@ def train_one_fold(
     """One full training run on one fold.  Returns the result dict."""
     device = cfg.device
     converter = make_converter(cfg.data.lang)
-    pad_idx = cfg.vocab.pad_idx
-    blank   = cfg.vocab.blank_idx
-    ctc_V   = cfg.vocab.ctc_vocab_size
+    pad_idx     = cfg.vocab.pad_idx          # CE ignore_index + dec_in filler
+    blank       = cfg.vocab.blank_idx
+    ctc_V       = cfg.vocab.ctc_vocab_size
+    att_V       = cfg.vocab.attn_vocab_size
+    sos_idx     = cfg.vocab.sos_idx
+    eos_idx     = cfg.vocab.eos_idx
+
+    if not (sos_idx < att_V and eos_idx < att_V and pad_idx < att_V):
+        raise RuntimeError(
+            f"VocabConfig out of sync: "
+            f"sos={sos_idx} eos={eos_idx} pad={pad_idx} att_V={att_V}. "
+            "All special tokens must be < att_V."
+        )
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir,        exist_ok=True)
@@ -170,7 +180,9 @@ def train_one_fold(
         input_layernorm = False,        # landmarks, Stage 1 v2 contract
     ).to(device)
     decoder = AttentionDecoder(
-        ctc_vocab_size = ctc_V,
+        att_vocab_size = att_V,
+        bos_idx        = sos_idx,
+        eos_idx        = eos_idx,
         d_model        = d_model,
         n_layers       = dec_n_layers,
         n_heads        = dec_n_heads,
@@ -179,7 +191,7 @@ def train_one_fold(
     ).to(device)
     bos = decoder.bos
     eos = decoder.eos
-    att_pad = pad_idx                      # CE ignores this index
+    att_pad = pad_idx                      # CE ignores this index, embed has room for it
 
     params = list(encoder.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.AdamW(
@@ -229,6 +241,17 @@ def train_one_fold(
             dec_in, dec_tg = build_attention_targets(
                 labels, lab_lens, bos=bos, eos=eos, pad=att_pad,
             )
+            # Synchronous bounds check on epoch-1 batch-1 — CUDA gather-OOB
+            # otherwise surfaces hours later as an async assertion failure.
+            if epoch == 0 and n_train_batches == 0:
+                _max_in = int(dec_in.max().item())
+                _max_tg = int(dec_tg.max().item())
+                if _max_in >= decoder.att_vocab_size or _max_tg >= decoder.att_vocab_size:
+                    raise RuntimeError(
+                        f"Attention-decoder index out of range: "
+                        f"max(dec_in)={_max_in}, max(dec_tg)={_max_tg}, "
+                        f"att_vocab_size={decoder.att_vocab_size}."
+                    )
             dec_logits = decoder(h, pad_mask, dec_in)            # [B, L, att_V]
             attn_loss  = ce(
                 dec_logits.reshape(-1, decoder.att_vocab_size),
