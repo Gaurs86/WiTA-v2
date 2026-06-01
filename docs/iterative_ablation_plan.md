@@ -6,10 +6,12 @@ new collaborators (and future-me) can read one file instead of stitching
 together prompts and notebooks.  Update it whenever a stage's verdict
 lands.
 
-Last updated: **after Stage 3 sweep** (DINOv2 fingertip-pool design FAILED
-the gating test on 4/5 folds; lost to Stage 1 v3 by +0.16 CER/fold).
-Frozen-appearance features confirmed insufficient for the kinematic task;
-Stage 4 fusion proposed only as a low-cost sanity check.
+Last updated: **after Stage 9a (joint CTC + attention on landmarks)** —
+**stretch-target pass.**  Headline is now **0.4889 ± 0.070 full / 0.4775 ±
+0.067 stripped**, beating Stage 1 v3 by 0.16 CER on every fold.  Stage 3
+(DINOv2 fingertip-pool) FAILED gating; Stage 4 (DINOv2 fusion) deprioritised
+because Stage 9a already exceeds the gain fusion was expected to produce.
+Next: Stage 9b (KenLM rescoring) + Stage 10 (DINOv2 unfreeze 1-fold gate).
 
 ---
 
@@ -47,8 +49,9 @@ Stage 4 fusion proposed only as a low-cost sanity check.
 | 6     | VideoMAE + landmarks                                   | pending     | prior 0.55–0.63 |   |
 | 7     | CLIP/SigLIP + landmarks                                | pending     | prior 0.57–0.64 |   |
 | 8     | X-CLIP + landmarks                                     | pending     | prior 0.58–0.66 |   |
-| 9     | Joint CTC + attention + KenLM on row-4 winner          | pending     | prior 0.36–0.48 |   |
-| 10    | Progressive unfreeze of winner                         | pending     | prior 0.32–0.44 |   |
+| **9a** | Joint CTC + attention on landmarks (no LM)           | **complete** | **0.4889 ± 0.070** | **0.4775 ± 0.067** | new headline; stretch pass |
+| 9b    | + KenLM 4-gram rescoring on top of 9a checkpoints      | next        | target 0.42–0.46 | target 0.41–0.45 | no retraining |
+| 10    | DINOv2 progressive unfreeze + fingertip-window attn (1 fold) | next | binary gate | binary gate | pass = ΔCER ≥ 0.20 on that fold |
 
 ---
 
