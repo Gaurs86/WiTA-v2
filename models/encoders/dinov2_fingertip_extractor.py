@@ -65,9 +65,95 @@ def bell_weights_3x3(sigma: float = 1.0,
     return w / w.sum()
 
 
+def bell_weights_window(k: int, sigma: float = 1.5,
+                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """
+    Gaussian bell weights on a (2k+1)x(2k+1) grid, peaked at the centre.
+    Sums to 1.
+
+    For k=3 (7x7 window) and sigma=1.5 the weights at radius 3 are
+    ~exp(-9/(2*2.25)) ≈ 0.135 of the centre weight, so the window edges
+    contribute but at <14% weight — a soft but finite cutoff.
+    """
+    if k < 0:
+        raise ValueError("k must be >= 0")
+    coords = torch.arange(-k, k + 1, dtype=dtype)
+    yy, xx = torch.meshgrid(coords, coords, indexing='ij')
+    w = torch.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+    return w / w.sum()
+
+
 # ---------------------------------------------------------------------------
 # 3x3 patch pool with edge clamping and weight renormalisation
 # ---------------------------------------------------------------------------
+
+def fingertip_pool_window(
+    patch_tokens: torch.Tensor,           # [G, G, D]  (gradient-bearing OK)
+    tip_xy_norm:  tuple[float, float] | torch.Tensor,
+    *,
+    k:            int = 3,
+    weights:      Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Bell-weighted (2k+1)x(2k+1) pool around the patch that contains the
+    fingertip.  Differentiable — used by Stage 10's end-to-end training
+    where gradients flow back through patch_tokens into DINOv2's unfrozen
+    last blocks.
+
+    Edge handling: window slices are clamped to the grid, then weights
+    are renormalised over the surviving cells.  No padding.
+
+    Parameters
+    ----------
+    patch_tokens : [G, G, D] (rows, cols, feature dim).
+    tip_xy_norm  : (x, y) in [0, 1] image-normalised coords.  x maps to
+                   columns, y to rows.
+    k            : radius.  k=1 → 3x3 (alias for fingertip_pool_3x3).
+                   k=3 → 7x7 (Stage 10 default).
+    weights      : optional (2k+1, 2k+1) weight tensor; defaults to
+                   bell_weights_window(k).
+
+    Returns
+    -------
+    pooled : [D]
+    """
+    if patch_tokens.dim() != 3:
+        raise ValueError(f"patch_tokens must be [G,G,D], got {patch_tokens.shape}")
+    if k < 0:
+        raise ValueError(f"k must be >= 0, got {k}")
+    G, G2, D = patch_tokens.shape
+    if G != G2:
+        raise ValueError(f"patch_tokens must be square in space; got {patch_tokens.shape}")
+    W = 2 * k + 1
+
+    device = patch_tokens.device
+    dtype  = patch_tokens.dtype
+    if weights is None:
+        weights = bell_weights_window(k, dtype=dtype).to(device)
+    else:
+        weights = weights.to(device=device, dtype=dtype)
+
+    if isinstance(tip_xy_norm, torch.Tensor):
+        tx, ty = float(tip_xy_norm[0].item()), float(tip_xy_norm[1].item())
+    else:
+        tx, ty = float(tip_xy_norm[0]), float(tip_xy_norm[1])
+    tx = min(max(tx, 0.0), 1.0)
+    ty = min(max(ty, 0.0), 1.0)
+    c = int(min(max(int(math.floor(tx * G)), 0), G - 1))
+    r = int(min(max(int(math.floor(ty * G)), 0), G - 1))
+
+    r0, r1 = max(r - k, 0), min(r + k + 1, G)
+    c0, c1 = max(c - k, 0), min(c + k + 1, G)
+    wr0 = r0 - (r - k)
+    wr1 = W - ((r + k + 1) - r1)
+    wc0 = c0 - (c - k)
+    wc1 = W - ((c + k + 1) - c1)
+
+    w = weights[wr0:wr1, wc0:wc1]
+    w = w / w.sum().clamp(min=1e-8)
+    region = patch_tokens[r0:r1, c0:c1, :]
+    return (region * w.unsqueeze(-1)).sum(dim=(0, 1))
+
 
 def fingertip_pool_3x3(
     patch_tokens: torch.Tensor,           # [G, G, D]

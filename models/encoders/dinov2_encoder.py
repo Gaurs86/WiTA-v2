@@ -88,9 +88,10 @@ class DINOv2Encoder(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "facebook/dinov2-small",
-        image_size: int = 224,
-        pool:       str = POOL_MEAN_PATCH,
+        model_name:       str = "facebook/dinov2-small",
+        image_size:       int = 224,
+        pool:             str = POOL_MEAN_PATCH,
+        unfreeze_last_n:  int = 0,
     ):
         super().__init__()
         try:
@@ -100,41 +101,79 @@ class DINOv2Encoder(nn.Module):
                 "transformers required for DINOv2. pip install transformers"
             ) from e
 
-        self.model_name = model_name
-        self.image_size = image_size
-        self.pool       = pool
+        self.model_name      = model_name
+        self.image_size      = image_size
+        self.pool            = pool
+        self.unfreeze_last_n = int(unfreeze_last_n)
 
         print(f"[DINOv2Encoder] Loading: {model_name} "
               f"(first run downloads weights — be patient)", flush=True)
         self.backbone = AutoModel.from_pretrained(model_name)
         self.out_dim: int = self.backbone.config.hidden_size
 
+        # 1) Freeze everything by default.
         for p in self.backbone.parameters():
             p.requires_grad = False
-        self.backbone.eval()
 
+        # 2) Selectively unfreeze the last N transformer blocks if requested.
+        #    HF DinoV2Model: backbone.encoder.layer is the list of blocks.
+        if self.unfreeze_last_n > 0:
+            layers = self.backbone.encoder.layer
+            n_layers = len(layers)
+            if self.unfreeze_last_n > n_layers:
+                raise ValueError(
+                    f"unfreeze_last_n={self.unfreeze_last_n} > total blocks "
+                    f"({n_layers}) in {model_name}"
+                )
+            unfreeze_idx = list(range(n_layers - self.unfreeze_last_n, n_layers))
+            for i in unfreeze_idx:
+                for p in layers[i].parameters():
+                    p.requires_grad = True
+            # Also unfreeze the post-encoder LayerNorm so gradients can flow
+            # cleanly out of the last block.
+            if hasattr(self.backbone, "layernorm"):
+                for p in self.backbone.layernorm.parameters():
+                    p.requires_grad = True
+            print(f"[DINOv2Encoder] Unfroze last {self.unfreeze_last_n} block(s): "
+                  f"indices {unfreeze_idx} + post-LN", flush=True)
+        else:
+            # Fully frozen: legacy behaviour.  eval() prevents BN/dropout
+            # surprises during inference-only use.
+            self.backbone.eval()
+
+        status = "frozen" if self.unfreeze_last_n == 0 else f"unfrozen last {self.unfreeze_last_n} blocks"
         print(
             f"[DINOv2Encoder] {model_name} loaded — "
-            f"out_dim={self.out_dim}, image_size={image_size}, pool={pool}, frozen",
+            f"out_dim={self.out_dim}, image_size={image_size}, pool={pool}, {status}",
             flush=True,
         )
         logger.info(
-            "[DINOv2Encoder] %s loaded — out_dim=%d, image_size=%d, pool=%s, frozen",
-            model_name, self.out_dim, image_size, pool,
+            "[DINOv2Encoder] %s loaded — out_dim=%d, image_size=%d, pool=%s, %s",
+            model_name, self.out_dim, image_size, pool, status,
         )
 
     def train(self, mode: bool = True) -> "DINOv2Encoder":
         super().train(mode)
-        self.backbone.eval()
+        if self.unfreeze_last_n == 0:
+            # Fully frozen path: keep backbone in eval to suppress dropout.
+            self.backbone.eval()
+        else:
+            # Partial-unfreeze path: backbone follows the caller's mode so
+            # dropout/LN behave correctly for the trainable blocks during
+            # training, and revert to eval during validation.
+            self.backbone.train(mode)
         return self
 
-    @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         Per-frame encode.
 
         pixel_values : [B, 3, H, W]  ImageNet-normalized
         returns      : [B, hidden_size]
+
+        Gradients flow when `unfreeze_last_n > 0`; otherwise wrap callers
+        in `torch.no_grad()` for free speed.  (We removed the unconditional
+        decorator so Stage 10 end-to-end training works.)
         """
         if pixel_values.dim() != 4:
             raise ValueError(
@@ -151,7 +190,6 @@ class DINOv2Encoder(nn.Module):
             return tokens.mean(dim=1)
         raise ValueError(f"unknown pool: {self.pool}")
 
-    @torch.no_grad()
     def forward_clip(
         self,
         pixel_values: torch.Tensor,
@@ -171,7 +209,6 @@ class DINOv2Encoder(nn.Module):
             outs.append(self.forward(pixel_values[i : i + chunk_size]))
         return torch.cat(outs, dim=0)
 
-    @torch.no_grad()
     def forward_patches(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         Return PER-PATCH token features (CLS excluded), un-pooled.
@@ -191,7 +228,6 @@ class DINOv2Encoder(nn.Module):
         out = self.backbone(pixel_values=pixel_values)
         return out.last_hidden_state[:, 1:]    # drop CLS
 
-    @torch.no_grad()
     def forward_patches_clip(
         self,
         pixel_values: torch.Tensor,
