@@ -28,6 +28,7 @@ import logging
 from collections import defaultdict
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -131,10 +132,24 @@ def train_one_fold(
     dec_n_heads:  int = 4,
     lambda_ctc:   float = 0.3,
     transform=None,
+    seed:           int | None = None,
     checkpoint_dir: str = "/kaggle/working/checkpoints",
     log_dir:        str = "/kaggle/working/logs",
 ) -> dict:
-    """One full training run on one fold.  Returns the result dict."""
+    """One full training run on one fold.  Returns the result dict.
+
+    If `seed` is given, the trainer re-seeds Python / NumPy / Torch right
+    before model construction so the run is reproducible-ish (modulo the
+    cudnn nondeterminism left in place by `cudnn.benchmark=True`).  Used
+    by the Stage 9a ablation matrix for the per-seed-variance estimate.
+    """
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     device = cfg.device
     converter = make_converter(cfg.data.lang)
     pad_idx     = cfg.vocab.pad_idx          # CE ignore_index + dec_in filler
@@ -208,6 +223,7 @@ def train_one_fold(
     history: list[dict] = []
     best_cer = float("inf"); best_epoch = -1
     best_per_signer: dict[str, float] = {}
+    best_mean_pred_len_ratio: float = float("nan")
     train_nll_ever_below_05 = False
     ckpt_path = os.path.join(
         checkpoint_dir, f"stage9a_fold{fold}_{variant}_best.pt",
@@ -324,6 +340,13 @@ def train_one_fold(
         cer_attn = sum(editdistance.eval(g, p) for g, p in pairs_attn) / max(sum(len(g) for g,_ in pairs_attn), 1)
         cer_best = sum(editdistance.eval(g, p) for g, p in pairs_best) / max(sum(len(g) for g,_ in pairs_best), 1)
 
+        # Length-collapse diagnostic: ratio of summed predicted chars to
+        # summed reference chars on the best-decoder predictions.
+        #   ~1.0 = balanced;  < 0.5 = under-predicting;  > 2.0 = over-predicting.
+        sum_pred = sum(len(p) for _, p in pairs_best)
+        sum_gt   = sum(len(g) for g, _ in pairs_best)
+        mean_pred_len_ratio = sum_pred / max(sum_gt, 1)
+
         per_signer_cer = {
             s: per_subj_err_b[s] / max(per_subj_len_b[s], 1)
             for s in per_subj_err_b
@@ -339,6 +362,7 @@ def train_one_fold(
         snap["cer_best"] = float(cer_best)
         snap["train_attn_loss"]  = float(train_attn)
         snap["train_total_loss"] = float(train_total)
+        snap["mean_pred_len_ratio"] = float(mean_pred_len_ratio)
         snap["per_signer_val_cer"] = per_signer_cer
         # Use the joint (best-of) CER as the headline.
         snap["val_cer_overall"] = float(cer_best)
@@ -362,6 +386,7 @@ def train_one_fold(
             best_cer = cer_best
             best_epoch = epoch + 1
             best_per_signer = dict(per_signer_cer)
+            best_mean_pred_len_ratio = float(mean_pred_len_ratio)
             torch.save({
                 "fold": fold, "variant": variant,
                 "encoder_state_dict": encoder.state_dict(),
@@ -383,6 +408,8 @@ def train_one_fold(
         "final_train_ctc_nll":        train_ctc,
         "final_train_attn_nll":       train_attn,
         "lambda_ctc":                 lambda_ctc,
+        "seed":                       seed,
+        "best_mean_pred_len_ratio":   best_mean_pred_len_ratio,
         "best_per_signer_val_cer":    best_per_signer,
         "history":                    history,
         "checkpoint_path":            ckpt_path,
