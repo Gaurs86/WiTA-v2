@@ -71,12 +71,13 @@ def ctc_prefix_beam_search(
     *,
     blank: int = 0,
     sep:   Optional[int] = None,   # CTC repeat separator; skipped in id_to_char output
-    beam:  int = 32,
+    beam:  int = 8,                # smaller default — char-level rarely needs > 8
     id_to_char: Optional[dict[int, str]] = None,
     lm = None,                     # CharNgramLM or None
     alpha: float = 0.5,            # LM weight (ln-space conversion handled internally)
     beta:  float = 0.0,            # length bonus
     blank_threshold: float = 0.0,  # skip extending past timesteps where blank > thr
+    symbol_top_k: Optional[int] = 10,  # only expand top-K likely symbols per step
 ) -> tuple[str, list[int]]:
     """
     Returns (decoded_string, decoded_id_list).  When `id_to_char` is None
@@ -98,6 +99,14 @@ def ctc_prefix_beam_search(
         # Skip extension at strongly-blank timesteps (cheap acceleration).
         if blank_threshold > 0.0 and math.exp(lp_t[blank]) >= blank_threshold:
             symbols_to_consider = [blank]
+        elif symbol_top_k is not None and symbol_top_k < V:
+            # Restrict to top-K symbols by log-prob this timestep, but
+            # always include the blank token (CTC depends on it for
+            # repeat segregation and blank-emission).
+            top_idx = np.argpartition(lp_t, -symbol_top_k)[-symbol_top_k:]
+            symbols_to_consider = set(int(i) for i in top_idx)
+            symbols_to_consider.add(blank)
+            symbols_to_consider = list(symbols_to_consider)
         else:
             symbols_to_consider = list(range(V))
 

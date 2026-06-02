@@ -195,8 +195,8 @@ def main(argv=None):
     p.add_argument('--lm',         default=None,
                    help='Path to a CharNgramLM .pkl (optional; required for LM modes).')
     p.add_argument('--mode', required=True,
-                   choices=['ctc_greedy', 'attn_greedy', 'ctc_lm_beam',
-                            'attn_beam', 'joint'])
+                   choices=['ctc_greedy', 'attn_greedy', 'ctc_beam',
+                            'ctc_lm_beam', 'attn_beam', 'joint'])
     p.add_argument('--on',   required=True, choices=['val', 'test'])
     p.add_argument('--sweep', nargs='*', default=[],
                    help="Sweep axes, e.g. 'alpha=0.3,0.5' 'beta=0.0,1.0'. "

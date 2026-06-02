@@ -257,7 +257,7 @@ def decode_one_clip(
     in_lens:         torch.Tensor,           # [1] long
     *,
     cfg,
-    mode:            str = "joint",          # 'ctc_greedy'|'attn_greedy'|'ctc_lm_beam'|'attn_beam'|'joint'
+    mode:            str = "joint",          # 'ctc_greedy'|'attn_greedy'|'ctc_beam'|'ctc_lm_beam'|'attn_beam'|'joint'
     beam_width:      int = 8,
     length_alpha:    float = 0.7,
     alpha_ctc:       float = 0.5,
@@ -267,7 +267,8 @@ def decode_one_clip(
     lm = None,
     ctc_lm_alpha:    float = 0.5,
     ctc_lm_beta:     float = 0.0,
-    ctc_lm_beam:     int = 32,
+    ctc_lm_beam:     int = 8,                  # was 32 — too slow for char-level
+    ctc_lm_symbol_top_k: int = 10,             # only expand top-K likely symbols per step
 ) -> str:
     """
     Decode a single clip via the requested strategy.  Returns the decoded
@@ -302,13 +303,25 @@ def decode_one_clip(
         ids = decoder.greedy_decode(h, pad_mask)[0].tolist()
         return _ids_to_str(ids)
 
+    if mode == "ctc_beam":
+        # CTC beam without LM — diagnostic baseline.  If this doesn't beat
+        # ctc_greedy, the issue is the algorithm itself, not the LM.
+        from .beam_search import ctc_prefix_beam_search
+        decoded, _ = ctc_prefix_beam_search(
+            lp_np, blank=blank, sep=sep, beam=ctc_lm_beam,
+            id_to_char=id_to_char, lm=None,
+            alpha=0.0, beta=ctc_lm_beta,
+            symbol_top_k=ctc_lm_symbol_top_k,
+        )
+        return decoded
+
     if mode == "ctc_lm_beam":
-        # Reuse the existing CTC prefix beam search.
         from .beam_search import ctc_prefix_beam_search
         decoded, _ = ctc_prefix_beam_search(
             lp_np, blank=blank, sep=sep, beam=ctc_lm_beam,
             id_to_char=id_to_char, lm=lm,
             alpha=ctc_lm_alpha, beta=ctc_lm_beta,
+            symbol_top_k=ctc_lm_symbol_top_k,
         )
         return decoded
 
