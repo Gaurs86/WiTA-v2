@@ -89,6 +89,10 @@ def ctc_prefix_beam_search(
     """
     T, V = log_probs.shape
     assert 0 <= blank < V, "blank index out of range"
+    # Defensive int casts — JSON-deserialised sweep configs hand us floats.
+    beam = int(beam)
+    if symbol_top_k is not None:
+        symbol_top_k = int(symbol_top_k)
     LN10 = math.log(10.0)
 
     init = _Beam(prefix=tuple(), log_pb=0.0, log_pnb=NEG_INF, log_lm=0.0)

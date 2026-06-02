@@ -165,14 +165,28 @@ def _config_hash(mode: str, hparams: dict) -> str:
     return hashlib.md5(json.dumps(h, sort_keys=True).encode()).hexdigest()[:10]
 
 
-def _parse_sweep(items: list[str]) -> dict[str, list[float]]:
+def _parse_sweep(items: list[str]) -> dict[str, list]:
     """
-    Parse --sweep 'alpha=0.3,0.5,0.7' 'beta=0.0,1.0' into a dict.
+    Parse --sweep 'alpha=0.3,0.5,0.7' 'beta=0.0,1.0' 'beam=8' into a dict.
+
+    Values are parsed as int when possible (no decimal point) and float
+    otherwise.  Integer-typed hyperparameters like beam width and
+    symbol_top_k must remain int because numpy / torch APIs are strict.
     """
-    out: dict[str, list[float]] = {}
+    def _smart_cast(s: str):
+        s = s.strip()
+        # Honour explicit int form (no '.'/'e'/'E') -> int.
+        if s and all(c in '0123456789-+' for c in s):
+            try:
+                return int(s)
+            except ValueError:
+                pass
+        return float(s)
+
+    out: dict[str, list] = {}
     for it in items:
         k, v = it.split('=', 1)
-        out[k] = [float(x) for x in v.split(',') if x.strip()]
+        out[k] = [_smart_cast(x) for x in v.split(',') if x.strip()]
     return out
 
 

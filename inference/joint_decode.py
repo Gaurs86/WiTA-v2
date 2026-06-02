@@ -125,7 +125,8 @@ def attention_beam_search(
     device   = memory.device
     bos, eos = decoder.bos, decoder.eos
     Vsize    = decoder.att_vocab_size
-    max_len  = max_len or decoder.max_decode_len
+    beam_width = int(beam_width)
+    max_len  = int(max_len or decoder.max_decode_len)
 
     # Start with one beam containing only BOS.
     beams = [_AttnBeam(ids=[], log_p=0.0)]
@@ -279,6 +280,10 @@ def decode_one_clip(
     blank  = cfg.vocab.blank_idx
     sep    = cfg.vocab.sep_idx
     id_to_char = {i + 1: c for i, c in enumerate(chars)}
+    # Defensive int casts — sweep configs sometimes hand us 10.0 instead of 10.
+    beam_width          = int(beam_width)
+    ctc_lm_beam         = int(ctc_lm_beam)
+    ctc_lm_symbol_top_k = int(ctc_lm_symbol_top_k)
 
     with torch.no_grad():
         h, pad_mask = encoder.encode(feats, in_lens)
