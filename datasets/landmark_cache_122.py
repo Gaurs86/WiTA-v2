@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import zipfile
 from pathlib import Path
 
@@ -334,6 +335,222 @@ def extract_dir_per_clip_landmarks(
         f"written={n_written}  reused={n_existing}  skipped={n_skipped}  "
         f"signers={len(seen_signers)}  "
         f"detect_rate={detect_frames_detected / max(detect_frames_total, 1) * 100:.2f}%",
+        flush=True,
+    )
+    return {
+        "split":             split,
+        "subset":            subset,
+        "n_total":           n_total,
+        "n_written":         n_written,
+        "n_existing":        n_existing,
+        "n_skipped":         n_skipped,
+        "n_signers":         len(seen_signers),
+        "signers":           sorted(seen_signers),
+        "detect_rate":       detect_frames_detected / max(detect_frames_total, 1),
+        "frames_detected":   detect_frames_detected,
+        "frames_total":      detect_frames_total,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing fast path
+# ---------------------------------------------------------------------------
+
+# Each worker holds ONE LandmarkExtractor in a module-level global.
+# fork() default on Linux means the children get the parent's loaded
+# Python state cheaply; the extractor is built lazily via init_worker().
+
+_worker_extractor = None      # type: ignore[var-annotated]
+
+
+def _init_worker():
+    """Pool initializer: build a fresh LandmarkExtractor per worker."""
+    global _worker_extractor
+    if _worker_extractor is None:
+        _worker_extractor = LandmarkExtractor()
+
+
+def _process_one_dir_clip(work_item: tuple) -> dict:
+    """
+    Worker side: read frames from disk, run MediaPipe + feature build,
+    write the per-clip .npz.  Returns small stats dict.
+
+    work_item:
+      (clip_dir_path, label, signer_id, clip_id, out_npz_path,
+       subset, max_frames, T_native, overwrite)
+    """
+    (clip_dir, label, signer_id, clip_id, out_npz,
+     subset, max_frames, T_native, overwrite) = work_item
+
+    if os.path.exists(out_npz) and not overwrite:
+        return {"existed": True}
+
+    try:
+        # Sort frames by filename then take up to max_frames uniformly.
+        from pathlib import Path
+        clip_dir = Path(clip_dir)
+        frame_paths = sorted(
+            [p for p in clip_dir.iterdir()
+             if p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+        )
+        if not frame_paths:
+            return {"skipped": True}
+        if max_frames and len(frame_paths) > max_frames:
+            idx = np.linspace(0, len(frame_paths) - 1, max_frames).round().astype(int)
+            frame_paths = [frame_paths[int(i)] for i in idx]
+        frames = [p.read_bytes() for p in frame_paths]
+
+        global _worker_extractor
+        if _worker_extractor is None:
+            _init_worker()
+
+        feats, stats = build_clip_features(
+            frames, _worker_extractor, T_native=T_native,
+        )
+
+        # Write uncompressed (np.savez): ~5x faster than savez_compressed
+        # for the per-clip overhead, ~150 MB total disk vs ~50 MB compressed.
+        # Still well under Kaggle's 20 GB /kaggle/working limit.
+        np.savez(
+            out_npz,
+            feature=feats.astype(np.float16),
+            label=label,
+            signer=signer_id,
+            subset=subset,
+            clip_id=clip_id,
+            detected=np.float32(stats["detect_rate"]),
+        )
+        return {
+            "written":          True,
+            "n_frames_seen":    stats["n_frames_seen"],
+            "n_frames_detected": stats["n_frames_detected"],
+        }
+    except Exception as e:
+        return {"skipped": True, "err": f"{type(e).__name__}: {e}"}
+
+
+def _collect_dir_work_items(
+    dir_path:  str,
+    out_dir:   str,
+    split:     str,
+    subset:    str,
+    max_frames: int,
+    T_native:   int,
+    overwrite:  bool,
+) -> tuple[list[tuple], set[str]]:
+    """Walk the directory once, return the list of per-clip work items."""
+    out_subset = Path(out_dir) / split / subset
+    out_subset.mkdir(parents=True, exist_ok=True)
+
+    work_items: list[tuple] = []
+    seen_signers: set[str] = set()
+    dir_path_p = Path(dir_path)
+
+    for gt_full in dir_path_p.rglob("gt.txt"):
+        parent_dir = gt_full.parent
+        parent_rel = str(parent_dir.relative_to(dir_path_p))
+        try:
+            signer_id = _signer_id_from_parent(parent_rel)
+        except ValueError as e:
+            logger.warning("  skip %s: %s", parent_rel, e)
+            continue
+        seen_signers.add(signer_id)
+        try:
+            with open(gt_full, "r", encoding="utf-8", errors="replace") as f:
+                labels = [ln.strip() for ln in f if ln.strip()]
+        except Exception as e:
+            logger.warning("  could not read %s: %s", gt_full, e)
+            continue
+
+        for clip_idx, label in enumerate(labels):
+            clip_id   = _safe_clip_id(parent_rel, clip_idx)
+            out_npz   = str(out_subset / f"{signer_id}__{clip_id}.npz")
+            clip_dir  = str(parent_dir / str(clip_idx))
+            work_items.append((
+                clip_dir, label, signer_id, clip_id, out_npz,
+                subset, max_frames, T_native, overwrite,
+            ))
+    return work_items, seen_signers
+
+
+def extract_dir_per_clip_landmarks_parallel(
+    dir_path:        str,
+    out_dir:         str,
+    split:           str,
+    subset:          str,
+    *,
+    n_workers:       int = 4,
+    max_frames:      int = 64,
+    T_native:        int = 32,
+    overwrite:       bool = False,
+    log_every:       int = 100,
+) -> dict:
+    """
+    Multi-process directory extractor.  ~4x faster than the serial
+    version on Kaggle's 4-core CPU.
+
+    Returns a stats dict in the same shape as the serial function.
+    """
+    import multiprocessing as mp
+
+    assert split  in {"train", "val", "test"}, split
+    assert subset in {"lex", "nonlex"}, subset
+
+    print(f"[landmark_cache_122] parallel ({n_workers} workers) "
+          f"processing {dir_path} -> {split}/{subset}", flush=True)
+
+    work_items, seen_signers = _collect_dir_work_items(
+        dir_path=dir_path, out_dir=out_dir, split=split, subset=subset,
+        max_frames=max_frames, T_native=T_native, overwrite=overwrite,
+    )
+    print(f"  {len(work_items)} clips queued ({len(seen_signers)} signers)",
+          flush=True)
+    if not work_items:
+        return {
+            "split": split, "subset": subset,
+            "n_total": 0, "n_written": 0, "n_existing": 0, "n_skipped": 0,
+            "n_signers": len(seen_signers), "signers": sorted(seen_signers),
+            "detect_rate": float("nan"),
+            "frames_detected": 0, "frames_total": 0,
+        }
+
+    # Use spawn-safe pool with the worker initializer.
+    ctx = mp.get_context("fork")        # Linux default; fastest on Kaggle
+    n_total = n_written = n_existing = n_skipped = 0
+    detect_frames_total = detect_frames_detected = 0
+    t0 = time.time()
+    with ctx.Pool(processes=n_workers, initializer=_init_worker) as pool:
+        for i, r in enumerate(pool.imap_unordered(_process_one_dir_clip,
+                                                  work_items, chunksize=8)):
+            n_total += 1
+            if r.get("existed"):
+                n_existing += 1
+            elif r.get("written"):
+                n_written += 1
+                detect_frames_total    += r["n_frames_seen"]
+                detect_frames_detected += r["n_frames_detected"]
+            else:
+                n_skipped += 1
+            if n_total % log_every == 0 or n_total == len(work_items):
+                elapsed = time.time() - t0
+                rate    = n_total / max(elapsed, 1e-3)
+                eta_min = (len(work_items) - n_total) / max(rate, 1e-3) / 60.0
+                drate   = (detect_frames_detected
+                           / max(detect_frames_total, 1) * 100.0)
+                print(
+                    f"  [{split}/{subset}] {n_total}/{len(work_items)}  "
+                    f"({rate:.1f} clips/s)  ETA {eta_min:5.1f} min  "
+                    f"written={n_written}  reused={n_existing}  "
+                    f"skipped={n_skipped}  detect={drate:.1f}%",
+                    flush=True,
+                )
+
+    print(
+        f"[landmark_cache_122] done  {split}/{subset}:  total={n_total}  "
+        f"written={n_written}  reused={n_existing}  skipped={n_skipped}  "
+        f"signers={len(seen_signers)}  "
+        f"detect_rate={detect_frames_detected / max(detect_frames_total, 1) * 100:.2f}%  "
+        f"elapsed={time.time()-t0:.0f}s",
         flush=True,
     )
     return {
