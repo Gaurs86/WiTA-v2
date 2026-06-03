@@ -41,6 +41,18 @@ def s1_check_data(opts):
 
 
 def s2_check_model(opts):
+    """
+    Build model + smoke forward.
+
+    IMPORTANT: the paper's resnet3d.py switches between two squeeze
+    patterns based on `opts.batch_size / cuda_device_count <= 1`.  If
+    we use a B=2 input tensor while opts.batch_size=1 (the argparse
+    default), we hit the squeeze-unsqueeze branch with a tensor it
+    can't reshape -- RuntimeError on permute.
+
+    Fix: use a smoke-test batch size that lines up with opts.batch_size,
+    so we exercise the same code path training will use.
+    """
     print("\n=== S2: model construction + forward ===")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     m = GestureTranslator(opts).to(device)
@@ -48,14 +60,22 @@ def s2_check_model(opts):
     trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
     print(f"  total params:    {total/1e6:.2f} M")
     print(f"  trainable:       {trainable/1e6:.2f} M")
-    x = torch.rand(2, 64, 3, 112, 112).to(device)
-    x_lens = torch.LongTensor([calc_seq_len(64), calc_seq_len(60)]).to(device)
-    attn_in = torch.tensor([[m.SOS_TOKEN, 3, 8, 15, m.PAD_TOKEN, m.PAD_TOKEN],
-                            [m.SOS_TOKEN, 21, 19, 8, 14, m.PAD_TOKEN]]).to(device)
+
+    # Pick a smoke-test B that matches opts so the paper's branch logic
+    # in resnet3d.py exercises the same code path as training.
+    B = max(int(opts.batch_size), 1)
+    # Cap at 4 to keep the smoke test cheap on memory.
+    B = min(B, 4)
+    T = 64
+    x = torch.rand(B, T, 3, 112, 112).to(device)
+    x_lens = torch.LongTensor([calc_seq_len(T)] * B).to(device)
+    sample_label = [m.SOS_TOKEN, 3, 8, 15, 12, m.PAD_TOKEN, m.PAD_TOKEN]
+    attn_in = torch.tensor([sample_label] * B).to(device)
     ctc, attn = m(x, x_lens, attn_input=attn_in)
-    print(f"  CTC logits shape : {tuple(ctc.shape)}   (expect [2, ~16, {m.vocab_ctc}])")
+    print(f"  smoke-test B     : {B}")
+    print(f"  CTC logits shape : {tuple(ctc.shape)}   (expect [{B}, ~16, {m.vocab_ctc}])")
     if attn is not None:
-        print(f"  Attn logits shape: {tuple(attn.shape)}   (expect [2, 6, {m.vocab_attn}])")
+        print(f"  Attn logits shape: {tuple(attn.shape)}   (expect [{B}, {len(sample_label)}, {m.vocab_attn}])")
     print("S2 OK")
     return m, device
 
@@ -63,10 +83,18 @@ def s2_check_model(opts):
 def s3_overfit(opts, model, device, n_iters=50):
     print(f"\n=== S3: single-batch overfit ({n_iters} iters; expect loss < 0.5) ===")
     data_train = AirTypingDataset(opts, opts.data_path_train)
-    idxs = list(range(min(8, len(data_train))))
+    # Use a small batch that still lands on the paper's else-branch in
+    # resnet3d.py (which needs B > opts.batch_size/device_count threshold).
+    # If user passed --batch_size>=2 this is consistent; if they passed
+    # batch_size=1 we bump the smoke batch to 1 to stay on the same branch.
+    smoke_B = max(2, min(int(opts.batch_size), 4))
+    if int(opts.batch_size) <= 1:
+        smoke_B = 1   # match paper's unsqueeze branch
+    idxs = list(range(min(max(smoke_B * 2, 8), len(data_train))))
     subset = Subset(data_train, idxs)
-    loader = DataLoader(subset, batch_size=4, shuffle=False,
+    loader = DataLoader(subset, batch_size=smoke_B, shuffle=False,
                         num_workers=0, collate_fn=pad_collate, drop_last=False)
+    print(f"  smoke-test loader batch = {smoke_B}")
     batch = next(iter(loader))
     xx_pad, yy_pad, x_lens, y_lens = batch
     xx_pad, yy_pad = xx_pad.to(device), yy_pad.to(device)
