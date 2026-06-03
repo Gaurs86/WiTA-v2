@@ -66,7 +66,7 @@ class VideoMAELoRA(nn.Module):
         super().__init__()
         try:
             from transformers import VideoMAEModel
-            from peft import LoraConfig, get_peft_model, TaskType
+            from peft import LoraConfig, inject_adapter_in_model
         except ImportError as e:
             raise ImportError(
                 "Stage 12 needs `pip install transformers peft` (and `torchvision` "
@@ -78,23 +78,28 @@ class VideoMAELoRA(nn.Module):
             self.backbone.gradient_checkpointing_enable()
         for p in self.backbone.parameters():
             p.requires_grad = False
-        # Inspect to confirm attention module names; HF's VideoMAE uses
-        # "query"/"key"/"value" inside the attention layer.
+        # IMPORTANT: use `inject_adapter_in_model` rather than
+        # `get_peft_model(...)`.  The PeftModel wrapper's forward
+        # explicitly passes input_ids=None / attention_mask=None to the
+        # base model -- VideoMAEModel.forward doesn't accept either,
+        # so wrapping it raises TypeError on the first forward pass.
+        # In-place injection inserts LoRA layers into q/k/v while
+        # leaving the backbone's class + forward signature untouched.
         target = ["query", "key", "value"]
         lcfg = LoraConfig(
             r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
             target_modules=target, bias="none",
-            task_type=TaskType.FEATURE_EXTRACTION,
+            # task_type intentionally omitted -- this is a vision encoder.
         )
-        self.backbone = get_peft_model(self.backbone, lcfg)
+        inject_adapter_in_model(lcfg, self.backbone)
         # Unfreeze the post-encoder LN so gradients can flow cleanly out.
         if hasattr(self.backbone, "layernorm"):
             for p in self.backbone.layernorm.parameters():
                 p.requires_grad = True
-        try:
-            self.backbone.print_trainable_parameters()
-        except Exception:
-            pass
+        trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.backbone.parameters())
+        print(f"[VideoMAELoRA] trainable params: {trainable:,} / {total:,} "
+              f"({100*trainable/total:.2f}%)", flush=True)
         self.out_dim = self.backbone.config.hidden_size
         # Tube spatial grid: 14x14 for 224/16; tube temporal: T/2 for T=16.
         self.spatial_patches  = (self.backbone.config.image_size // self.backbone.config.patch_size) ** 2
