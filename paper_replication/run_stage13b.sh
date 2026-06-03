@@ -10,8 +10,9 @@ BATCH="${BATCH:-8}"
 EPOCHS="${EPOCHS:-175}"
 LR="${LR:-1e-3}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-MAX_FRAMES="${MAX_FRAMES:-96}"  # 0 = no cap; 96 bounds memory + speeds compute on long clips
+MAX_FRAMES="${MAX_FRAMES:-64}"  # 0 = no cap; 64 bounds memory + speeds compute (words are short)
 USE_AMP="${USE_AMP:-True}"      # mixed precision: ~2x faster, ~half memory
+CACHE_DIR="${CACHE_DIR:-}"      # set to a dir (e.g. $HOME/wita-cache) to use the decode cache
 
 export PYTHONHASHSEED=0
 # NOTE: deterministic cuBLAS is incompatible with AMP perf; only set it
@@ -47,6 +48,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --attn_max_len=32 \
     --max_frames="${MAX_FRAMES}" \
     --use_amp="${USE_AMP}" \
+    --cache_dir="${CACHE_DIR}" \
     --save_frequency=25 \
     --log_interval=50 \
     --seed_number=0 \
@@ -72,6 +74,7 @@ python eval_test.py \
     --attn_decoder_heads=4 \
     --attn_max_len=32 \
     --max_frames="${MAX_FRAMES}" \
+    --cache_dir="${CACHE_DIR}" \
     --load_dir="${SAVE_NAME}/models/best" \
     --data_path_test="${DATA_ROOT}/test" \
     2>&1 | tee "logs/${SAVE_NAME}_test.log"

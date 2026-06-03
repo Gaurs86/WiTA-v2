@@ -26,6 +26,13 @@ class AirTypingDataset(Dataset):
         # length, which can OOM even at batch=8.  We uniform-sample down
         # to max_frames, preserving the full gesture span.
         self.max_frames = int(getattr(opts, 'max_frames', 0) or 0)
+        # Optional decode cache (CER-neutral speedup): stores the EXACT
+        # decoded+resized+capped uint8 frames per clip.  read_images
+        # reconstructs PIL via Image.fromarray (lossless for uint8 RGB)
+        # and runs the unchanged augmentation pipeline -> bit-identical
+        # model input, no CER impact.  Eliminates the per-epoch JPEG
+        # decode that bottlenecks the 4-vCPU data loader.
+        self.cache_dir = str(getattr(opts, 'cache_dir', '') or '')
         if self.data_type == "english":
             self.converter = utils.StrLabelConverter(utils.ALPHABET)
         elif self.data_type == "korean":
@@ -81,20 +88,47 @@ class AirTypingDataset(Dataset):
     def __len__(self):
         return len(self.video_list)
 
-    def read_images(self, index):
+    # ------------------------------------------------------------------
+    # Decode cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_path(self, video_dir):
+        """Deterministic cache filename for a clip (md5 of abspath)."""
+        import hashlib
+        h = hashlib.md5(os.path.abspath(video_dir).encode()).hexdigest()
+        return os.path.join(self.cache_dir, h + '.npy')
+
+    def decode_resize_frames(self, index):
+        """JPEG decode + resize + temporal cap.  Returns a list of PIL
+        images.  NEVER touches the cache -- this is the ground-truth
+        pipeline the cache must reproduce bit-for-bit."""
+        import numpy as _np
         selected_video = self.video_list[index]
         frames = sorted(os.listdir(selected_video))
-        # Temporal cap via uniform sampling (keeps first + last frame).
         if self.max_frames and len(frames) > self.max_frames:
-            import numpy as _np
             sel = _np.linspace(0, len(frames) - 1, self.max_frames).round().astype(int)
             frames = [frames[i] for i in sel]
-        list_of_images = []
+        out = []
         for frame_name in frames:
             frame = Image.open(os.path.join(selected_video, frame_name))
             if self.img_size == 112:
                 frame = self.resize(frame)
-            list_of_images.append(frame)
+            out.append(frame)
+        return out
+
+    def _resized_pil_frames(self, index):
+        """Resized PIL frames, from the decode cache if present (loss-less
+        for uint8 RGB) else from JPEG decode."""
+        import numpy as _np
+        if self.cache_dir:
+            cpath = self._cache_path(self.video_list[index])
+            if os.path.isfile(cpath):
+                arr = _np.load(cpath)                 # [T, H, W, 3] uint8
+                return [Image.fromarray(arr[i]) for i in range(arr.shape[0])]
+        return self.decode_resize_frames(index)
+
+    def read_images(self, index):
+        list_of_images = self._resized_pil_frames(index)
         if self.data_augment:
             list_of_images = self.video_transform_aug(list_of_images)
         else:

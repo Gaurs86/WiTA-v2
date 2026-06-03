@@ -120,6 +120,11 @@ class AirTypingOptions:
                                  help="mixed-precision training (fp16 autocast + GradScaler). "
                                       "~2x faster + ~half memory on a single GPU.  CTC/CE "
                                       "losses still computed in fp32 for stability.")
+        self.parser.add_argument("--cache_dir",            type=str, default='',
+                                 help="dir of pre-decoded uint8 frame caches (built by "
+                                      "build_cache.py).  CER-neutral: stores the exact "
+                                      "decoded+resized+capped frames; augmentation still "
+                                      "runs per-epoch.  Eliminates the JPEG-decode bottleneck.")
 
     def parse(self):
         self.options = self.parser.parse_args()
