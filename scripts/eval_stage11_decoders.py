@@ -262,10 +262,17 @@ def main(argv=None):
     # ----- val sweep -----
     if args.on == 'val':
         sweep = _parse_sweep(args.sweep)
+        # If no --sweep axes were given, honour --hparams as the single
+        # config.  Previously this branch ignored --hparams entirely,
+        # producing rows with `hparams={}` and the script's hard-coded
+        # decode defaults.
         if not sweep:
-            sweep = {}      # single eval with defaults
+            single_hp = json.loads(args.hparams) if args.hparams else {}
+            configs = [single_hp]
+        else:
+            configs = list(_iter_sweep(sweep))
         results: list[dict] = []
-        for hp in _iter_sweep(sweep):
+        for hp in configs:
             print(f'\n--- val sweep config: {hp}')
             out = _evaluate(encoder, decoder, loader, cfg, device,
                             mode=args.mode, hparams=hp, lm=lm)
