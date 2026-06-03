@@ -174,6 +174,15 @@ class Trainer:
         # ---- losses ----
         self.ctc_loss = torch.nn.CTCLoss(reduction='mean', zero_infinity=True)
 
+        # ---- mixed precision ----
+        # r3d_18 in fp32 on a single GPU is ~2x slower than fp16 tensor
+        # cores can do.  AMP roughly halves memory (enabling batch=8 even
+        # with the frame cap) and ~2x throughput.  CTC + CE losses are
+        # computed in fp32 (outside autocast) for numerical stability.
+        self.use_amp = bool(getattr(self.opts, 'use_amp', True)) and torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.logger.info(f"AMP enabled: {self.use_amp}")
+
         self.epoch = 0
         self.step = 0
         self.start_step = 0
@@ -203,6 +212,8 @@ class Trainer:
             x_lens, y_lens = x_lens.to(self.device), y_lens.to(self.device)
             self.optimizer.zero_grad()
 
+            # Forward in mixed precision; losses in fp32 (outside autocast)
+            # for CTC/CE numerical stability.
             if self.use_joint:
                 attn_in, attn_tgt = build_attn_io(
                     yy_pad, y_lens,
@@ -210,26 +221,29 @@ class Trainer:
                     eos=GestureTranslator.EOS_TOKEN,
                     pad=GestureTranslator.PAD_TOKEN,
                 )
-                ctc_logits, attn_logits = self.model(xx_pad, x_lens, attn_input=attn_in)
-                ctc_log_probs = ctc_logits.permute(1, 0, 2).log_softmax(-1)
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    ctc_logits, attn_logits = self.model(xx_pad, x_lens, attn_input=attn_in)
+                ctc_log_probs = ctc_logits.float().permute(1, 0, 2).log_softmax(-1)
                 ctc_loss = self.ctc_loss(ctc_log_probs, yy_pad, x_lens, y_lens)
                 attn_loss = F.cross_entropy(
-                    attn_logits.reshape(-1, attn_logits.size(-1)),
+                    attn_logits.float().reshape(-1, attn_logits.size(-1)),
                     attn_tgt.reshape(-1),
                     ignore_index=GestureTranslator.PAD_TOKEN,
                     label_smoothing=self.opts.label_smoothing,
                 )
                 loss = self.opts.lambda_ctc * ctc_loss + (1 - self.opts.lambda_ctc) * attn_loss
             else:
-                ctc_logits, _ = self.model(xx_pad, x_lens)
-                ctc_log_probs = ctc_logits.permute(1, 0, 2).log_softmax(-1)
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    ctc_logits, _ = self.model(xx_pad, x_lens)
+                ctc_log_probs = ctc_logits.float().permute(1, 0, 2).log_softmax(-1)
                 loss = self.ctc_loss(ctc_log_probs, yy_pad, x_lens, y_lens)
                 ctc_loss = loss
                 attn_loss = torch.tensor(0.0, device=self.device)
 
             losses.append(loss.item())
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             if self.scheduler:
                 self.scheduler.step()
 
@@ -259,16 +273,18 @@ class Trainer:
             for batch_idx, (xx_pad, yy_pad, x_lens, y_lens) in enumerate(data_loader):
                 xx_pad, yy_pad = xx_pad.to(self.device), yy_pad.to(self.device)
                 x_lens, y_lens = x_lens.to(self.device), y_lens.to(self.device)
-                ctc_logits, _ = self.model(xx_pad, x_lens)
-                ctc_log_probs = ctc_logits.permute(1, 0, 2).log_softmax(-1)
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    ctc_logits, _ = self.model(xx_pad, x_lens)
+                ctc_log_probs = ctc_logits.float().permute(1, 0, 2).log_softmax(-1)
                 loss = self.ctc_loss(ctc_log_probs, yy_pad, x_lens, y_lens)
                 losses.append(loss.item())
 
                 if self.use_joint:
                     # Decode via attention head (greedy autoregressive).
-                    pred_tokens = self.model_without_dp.decode_attention(
-                        xx_pad, x_lens, max_len=self.opts.attn_max_len,
-                    )
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        pred_tokens = self.model_without_dp.decode_attention(
+                            xx_pad, x_lens, max_len=self.opts.attn_max_len,
+                        )
                     gt_b = self._decode_label(yy_pad[0, :y_lens[0]],
                                               data_loader.dataset.converter)
                     pred_b = self._decode_attn(pred_tokens[0].tolist(),

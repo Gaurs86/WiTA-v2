@@ -6,14 +6,19 @@ set -euo pipefail
 
 DATA_ROOT="${DATA_ROOT:-$HOME/wita-data/english}"
 SAVE_NAME="${SAVE_NAME:-stage13b_joint}"
-BATCH="${BATCH:-16}"
+BATCH="${BATCH:-8}"
 EPOCHS="${EPOCHS:-175}"
 LR="${LR:-1e-3}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-MAX_FRAMES="${MAX_FRAMES:-0}"   # 0 = no cap; set e.g. 96 to bound memory on long clips
+NUM_WORKERS="${NUM_WORKERS:-4}"
+MAX_FRAMES="${MAX_FRAMES:-96}"  # 0 = no cap; 96 bounds memory + speeds compute on long clips
+USE_AMP="${USE_AMP:-True}"      # mixed precision: ~2x faster, ~half memory
 
 export PYTHONHASHSEED=0
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
+# NOTE: deterministic cuBLAS is incompatible with AMP perf; only set it
+# when USE_AMP is False (paper-exact deterministic fp32 reproduction).
+if [ "${USE_AMP}" = "False" ]; then
+    export CUBLAS_WORKSPACE_CONFIG=:4096:8
+fi
 
 mkdir -p logs
 
@@ -41,6 +46,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --label_smoothing=0.1 \
     --attn_max_len=32 \
     --max_frames="${MAX_FRAMES}" \
+    --use_amp="${USE_AMP}" \
     --save_frequency=25 \
     --log_interval=50 \
     --seed_number=0 \

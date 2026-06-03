@@ -116,6 +116,10 @@ class AirTypingOptions:
                                  help="cap clip length to this many frames via uniform "
                                       "temporal sampling (0 = no cap).  Bounds GPU memory "
                                       "for very long clips; CTC T_out = max_frames/4.")
+        self.parser.add_argument("--use_amp",              type=_str2bool, default=True,
+                                 help="mixed-precision training (fp16 autocast + GradScaler). "
+                                      "~2x faster + ~half memory on a single GPU.  CTC/CE "
+                                      "losses still computed in fp32 for stability.")
 
     def parse(self):
         self.options = self.parser.parse_args()
