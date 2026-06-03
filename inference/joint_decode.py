@@ -220,11 +220,18 @@ def joint_rescore(
               + gamma_len * len(ids)`
     """
     LN10 = math.log(10.0)
+    ctc_V = ctc_log_probs.shape[1]            # CTC vocab size (28 for English)
     out: list[JointHypothesis] = []
     for cand in candidates:
         ids = list(cand.ids)
         attn_lp = float(cand.log_p)
-        ctc_lp  = ctc_sequence_log_prob(ctc_log_probs, ids, blank=blank) \
+        # The attention beam may occasionally emit BOS/EOS/PAD tokens
+        # (indices 28, 29, 30 for English) which don't exist in the CTC
+        # vocab.  Filter to char-only (1 <= i < ctc_V) before scoring.
+        # We score the displayed string under CTC; PAD/BOS at the
+        # boundaries are noise either way.
+        ids_ctc = [i for i in ids if 1 <= i < ctc_V]
+        ctc_lp  = ctc_sequence_log_prob(ctc_log_probs, ids_ctc, blank=blank) \
                   if alpha_ctc != 0.0 else NEG_INF
         decoded = ""
         if id_to_char is not None:
