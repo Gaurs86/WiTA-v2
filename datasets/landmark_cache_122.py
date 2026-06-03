@@ -48,22 +48,33 @@ from .dataset         import _parse_gt, _read_frames_from_zip
 logger = logging.getLogger(__name__)
 
 
-_SIGNER_PREFIX_RE = re.compile(r"^([A-Za-z]{2,4})_")
+# Anchor on the gender token (Male|Female) rather than a fixed-length signer
+# alphabet.  The 38-signer cohort used 3-letter all-caps initials (CHJ, LSY,
+# ...) which fit `[A-Za-z]{2,4}`, but the full 122-signer corpus also
+# includes lowercase romanised names (gyujun, hankyeol) and digit suffixes
+# (lcw2).  The OLD regex silently dropped those signers; Stage 11's headline
+# was computed on an incomplete paper-split.
+_SIGNER_PREFIX_RE = re.compile(
+    r"^(?P<signer>.+?)_(?:Male|Female)_\d+",
+    re.IGNORECASE,
+)
 
 
 def _signer_id_from_parent(parent: str) -> str:
     """
-    Extract the signer ID prefix from a `<SIGNER>_<gender>_<age>_<lang>_<type>`
-    subdirectory.  Reuses the same convention as the HF zip filenames.
+    Extract the signer ID prefix from a
+    `<SIGNER>_<gender>_<age>_<lang>_<type>` subdirectory.  Captures the
+    full token before `_(Male|Female)_<digits>`.  Uppercased so the
+    handcrop + landmark caches join on a single canonical case.
     """
     base = os.path.basename(parent.rstrip("/"))
     m = _SIGNER_PREFIX_RE.match(base)
     if not m:
         raise ValueError(
             f"Could not extract signer ID from subdir {base!r}.  "
-            "Expected layout: <SIGNER>_<gender>_<age>_<lang>_<type>/"
+            "Expected layout: <SIGNER>_(Male|Female)_<age>_<lang>_<type>/"
         )
-    return m.group(1).upper()
+    return m.group("signer").upper()
 
 
 def _safe_clip_id(parent: str, clip_idx: int) -> str:
