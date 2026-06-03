@@ -553,18 +553,29 @@ def train_stage12(
                                dec_tg.reshape(-1))
                 total = lambda_ctc * ctc_loss + (1 - lambda_ctc) * attn_loss
 
+            # Only step the LR scheduler if the optimizer actually stepped.
+            # AMP can skip an optimizer step on the very first iteration
+            # if it detects inf/nan during loss scaling; stepping the
+            # scheduler anyway emits a "scheduler.step() before
+            # optimizer.step()" warning and silently skips an LR value.
+            optimizer_stepped = True
             if scaler.is_enabled():
                 scaler.scale(total).backward()
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_([p for g in param_groups for p in g["params"]],
                                          grad_clip)
+                old_scale = scaler.get_scale()
                 scaler.step(optimizer); scaler.update()
+                # If GradScaler skipped the step (e.g. due to inf in grads),
+                # the scale factor changes; compare before/after to detect.
+                optimizer_stepped = scaler.get_scale() >= old_scale
             else:
                 total.backward()
                 nn.utils.clip_grad_norm_([p for g in param_groups for p in g["params"]],
                                          grad_clip)
                 optimizer.step()
-            scheduler.step()
+            if optimizer_stepped:
+                scheduler.step()
 
             sum_ctc   += float(ctc_loss.item())
             sum_attn  += float(attn_loss.item())

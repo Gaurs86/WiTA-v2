@@ -75,7 +75,16 @@ class VideoMAELoRA(nn.Module):
         self.model_name = model_name
         self.backbone = VideoMAEModel.from_pretrained(model_name)
         if gradient_checkpointing:
-            self.backbone.gradient_checkpointing_enable()
+            # use_reentrant=False is REQUIRED here.  pixel_values is fp16/32
+            # promoted from uint8 with requires_grad=False, and reentrant
+            # checkpointing short-circuits the backward graph when no input
+            # has requires_grad -- meaning the LoRA params get ZERO grad
+            # and Stage 12 silently degenerates to a frozen-backbone run.
+            # The non-reentrant path tracks gradients via the autograd
+            # graph regardless of input requires_grad.
+            self.backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
         for p in self.backbone.parameters():
             p.requires_grad = False
         # IMPORTANT: use `inject_adapter_in_model` rather than
