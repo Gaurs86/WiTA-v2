@@ -112,6 +112,10 @@ class AirTypingOptions:
         self.parser.add_argument("--label_smoothing",      type=float, default=0.1)
         self.parser.add_argument("--attn_max_len",         type=int, default=32,
                                  help="max decoded length for greedy attention decode at eval")
+        self.parser.add_argument("--max_frames",           type=int, default=0,
+                                 help="cap clip length to this many frames via uniform "
+                                      "temporal sampling (0 = no cap).  Bounds GPU memory "
+                                      "for very long clips; CTC T_out = max_frames/4.")
 
     def parse(self):
         self.options = self.parser.parse_args()

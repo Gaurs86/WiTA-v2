@@ -21,6 +21,11 @@ class AirTypingDataset(Dataset):
         self.data_path = data_path
         self.data_type = opts.data_type
         self.data_augment = opts.data_augment
+        # Cap clip length (0 = no cap).  Bounds 3D-conv activation memory:
+        # a single very long clip forces the whole padded batch to its
+        # length, which can OOM even at batch=8.  We uniform-sample down
+        # to max_frames, preserving the full gesture span.
+        self.max_frames = int(getattr(opts, 'max_frames', 0) or 0)
         if self.data_type == "english":
             self.converter = utils.StrLabelConverter(utils.ALPHABET)
         elif self.data_type == "korean":
@@ -79,6 +84,11 @@ class AirTypingDataset(Dataset):
     def read_images(self, index):
         selected_video = self.video_list[index]
         frames = sorted(os.listdir(selected_video))
+        # Temporal cap via uniform sampling (keeps first + last frame).
+        if self.max_frames and len(frames) > self.max_frames:
+            import numpy as _np
+            sel = _np.linspace(0, len(frames) - 1, self.max_frames).round().astype(int)
+            frames = [frames[i] for i in sel]
         list_of_images = []
         for frame_name in frames:
             frame = Image.open(os.path.join(selected_video, frame_name))

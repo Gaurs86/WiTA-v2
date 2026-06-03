@@ -10,6 +10,7 @@ BATCH="${BATCH:-16}"
 EPOCHS="${EPOCHS:-175}"
 LR="${LR:-1e-3}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+MAX_FRAMES="${MAX_FRAMES:-0}"   # 0 = no cap; set e.g. 96 to bound memory on long clips
 
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
@@ -39,6 +40,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --attn_decoder_heads=4 \
     --label_smoothing=0.1 \
     --attn_max_len=32 \
+    --max_frames="${MAX_FRAMES}" \
     --save_frequency=25 \
     --log_interval=50 \
     --seed_number=0 \
@@ -63,6 +65,7 @@ python eval_test.py \
     --attn_decoder_layers=2 \
     --attn_decoder_heads=4 \
     --attn_max_len=32 \
+    --max_frames="${MAX_FRAMES}" \
     --load_dir="${SAVE_NAME}/models/best" \
     --data_path_test="${DATA_ROOT}/test" \
     2>&1 | tee "logs/${SAVE_NAME}_test.log"
