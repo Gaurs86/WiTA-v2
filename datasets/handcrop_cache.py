@@ -170,7 +170,11 @@ def _process_one_handcrop(work_item: tuple) -> dict:
             frame_paths, _worker_extractor,
             T=T, crop_size=crop_size, pad_factor=pad_factor,
         )
-        np.savez(
+        # COMPRESSED — Kaggle /kaggle/working/ is 20 GB; uint8 hand-crop
+        # video compresses 3-5x with deflate (background pixels dominate).
+        # Uncompressed (~2.4 MB/clip × 10K) overflowed at train/lex 6517.
+        # Load-time decompression cost is negligible vs the GPU forward.
+        np.savez_compressed(
             out_npz,
             video=video,                              # [T, crop_size, crop_size, 3] uint8
             label=label, signer=signer_id, subset=subset,
@@ -254,11 +258,23 @@ def extract_dir_handcrops_parallel(
       "workers initialising" from "workers deadlocked".
     """
     import multiprocessing as mp
+    import shutil
     assert split  in {"train", "val", "test"}
     assert subset in {"lex", "nonlex"}
 
+    # Disk guard: bail fast if free space is too low to even start.
+    # Compressed clips are ~600-800 KB; demand at least 1.5 GB headroom.
+    free = shutil.disk_usage(out_dir).free
+    if free < 1_500_000_000:
+        raise RuntimeError(
+            f"[handcrop_cache] only {free/1e9:.2f} GB free under {out_dir} -- "
+            f"refusing to start.  Wipe the partial cache or move to a bigger "
+            f"output dir before re-running."
+        )
+
     print(f"[handcrop_cache] parallel ({n_workers} workers) "
-          f"{dir_path} -> {split}/{subset}  T={T} crop={crop_size}", flush=True)
+          f"{dir_path} -> {split}/{subset}  T={T} crop={crop_size}  "
+          f"free={free/1e9:.1f} GB", flush=True)
     work, signers = _collect_handcrop_work_items(
         dir_path=dir_path, out_dir=out_dir, split=split, subset=subset,
         T=T, crop_size=crop_size, pad_factor=pad_factor, overwrite=overwrite,
