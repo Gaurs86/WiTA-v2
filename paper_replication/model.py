@@ -203,8 +203,13 @@ class GestureTranslator(nn.Module):
         pos_idx = torch.arange(L, device=attn_input.device)
         tgt_emb = tgt_emb + self.pos_embed(pos_idx).unsqueeze(0)
 
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(L).to(memory.device)
-        tgt_pad_mask = (attn_input == self.PAD_TOKEN)              # [B, L]
+        # Both masks must share a dtype (PyTorch 2.x): use BOOL for both.
+        # A True entry means "not allowed to attend".  The causal mask is
+        # upper-triangular (can't see the future); the pad mask blocks PAD.
+        causal_mask = torch.triu(
+            torch.ones(L, L, dtype=torch.bool, device=memory.device), diagonal=1,
+        )                                                          # [L, L] bool
+        tgt_pad_mask = (attn_input == self.PAD_TOKEN)              # [B, L] bool
 
         attn_out = self.attn_decoder(
             tgt_emb, memory,
@@ -231,7 +236,9 @@ class GestureTranslator(nn.Module):
             tgt_emb = self.token_embed(tokens)
             pos_idx = torch.arange(L, device=device)
             tgt_emb = tgt_emb + self.pos_embed(pos_idx).unsqueeze(0)
-            causal = nn.Transformer.generate_square_subsequent_mask(L).to(device)
+            causal = torch.triu(
+                torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1,
+            )                                                      # [L, L] bool
             attn_out = self.attn_decoder(tgt_emb, memory, tgt_mask=causal)
             logits = self.attn_head(attn_out[:, -1, :])           # [B, vocab_attn]
             next_tok = logits.argmax(-1)                          # [B]
