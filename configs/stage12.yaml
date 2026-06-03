@@ -1,0 +1,116 @@
+# configs/stage12.yaml — representation-side intervention.
+#
+# VideoMAE-base + LoRA on q/k/v fused with the existing 190-d landmark
+# stream, then the Stage-9a-winning Conformer encoder and joint
+# CTC + attention head.
+#
+# Hyperparameters in §encoder/§decoder/§loss are FROZEN from the Stage 9a
+# ablation winners and Stage 11; the new knobs are the backbone, LoRA,
+# fusion, and the two-LR optimizer.  See §7 of the Stage 12 prompt
+# for the reproducibility contract.
+
+stage: stage12_videomae_lora_landmark_fusion
+seed:  42
+
+data:
+  handcrop_root:  /kaggle/input/wita-handcrop-cache-videomae/handcrop_cache
+  landmark_root:  /kaggle/input/wita-full-english-landmark-cache/landmark_cache_122
+  splits:
+    train: train
+    val:   val
+    test:  test
+  subsets:  [lex, nonlex]
+  lang:     english
+  T_native: 32                       # landmark + fusion length; backbone tubes upsample to this
+  input_dim_landmark: 190
+  handcrop:
+    T:         16                    # VideoMAE-base accepts T=16 by default
+    crop_size: 224
+    pad_factor: 1.3
+
+model:
+  backbone:
+    arch:           VideoMAELoRA
+    model_name:     MCG-NJU/videomae-base
+    lora_r:         16
+    lora_alpha:     32
+    lora_dropout:   0.1
+    target_modules: [query, key, value]
+    gradient_checkpointing: true
+    unfreeze_post_layernorm: true
+  fusion:
+    d_video:          768            # VideoMAE-base hidden_size
+    d_landmark:       190
+    d_landmark_proj:  128
+    d_model:          256
+    dropout:          0.2
+  encoder:
+    arch:        ConformerCTC
+    in_dim:      256                 # fused feature, NOT 190
+    d_model:     256
+    n_layers:    4
+    n_heads:     4
+    conv_kernel: 15
+    ff_mult:     4
+    dropout:     0.2
+    upsample:    2                   # T_out = 64
+    input_layernorm: false           # fusion stack already LN'd its output
+  decoder:
+    arch:     AttentionDecoder
+    n_layers: 2                      # Stage 9a ablation winner
+    d_model:  256
+    n_heads:  4
+    ff_mult:  4
+    dropout:  0.2
+
+loss:
+  lambda_ctc:        0.5             # Stage 9a ablation winner, frozen
+  ctc_zero_infinity: true
+  label_smoothing:   0.1             # attention CE only
+
+augmentation:
+  # Stage 12 prompt §4: landmark augmentation OFF for this run
+  # to isolate the backbone effect.  Re-enable as a follow-up ablation.
+  landmark: none
+  video:    none                     # no temporal/spatial jitter on the video stream yet
+
+training:
+  num_epochs:       50
+  batch_size:       16               # T4 fits ~16 with grad-ckpt + fp16
+  optimizer:        AdamW
+  lr_backbone:      5.0e-5           # LoRA params + post-LN
+  lr_head:          5.0e-4           # fusion + encoder + decoder
+  weight_decay:     5.0e-2
+  betas:            [0.9, 0.999]
+  grad_clip:        1.0
+  scheduler:        OneCycleLR
+  warmup_pct:       0.05
+  anneal_strategy:  cos
+  num_workers:      2
+  amp_dtype:        fp16             # T4 path; switch to bf16 on A100
+  gradient_checkpointing: true
+
+checkpoint:
+  selection_metric: val_overall_cer
+  selection_mode:   min
+
+test:
+  evaluate_once:    true             # marker file gates re-runs
+  subsets:          [lex, nonlex]
+
+paper_baseline:
+  source:   "Kim et al. 2023"
+  overall:  0.2924
+  lex:      0.281
+  nonlex:   0.365
+
+stage11_baseline:
+  overall:  0.4498
+  lex:      0.4348
+  notes:    "landmark-only paper-split headline"
+
+pass_fail_bands:
+  strong_pass:   {test_overall_cer_max: 0.32, test_lex_cer_max: 0.30}
+  pass:          {test_overall_cer_max: 0.38, test_lex_cer_max: 0.35}
+  partial:       {test_overall_cer_max: 0.42}
+  underperforms: {test_overall_cer_min: 0.42}
