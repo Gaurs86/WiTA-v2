@@ -94,8 +94,12 @@ class WiTAPaperSplitDualDataset(Dataset):
         self.converter = converter
 
         # Inner-join the two caches by stem '<SIGNER>__<clip_id>'.
+        # Skip clips present in only one cache, report counts + first-N
+        # examples per subset, continue training on the join.  Use print()
+        # rather than logger.warning so Kaggle stdout always shows it.
         self.entries: list[dict] = []
-        missing_v = missing_l = 0
+        miss_per_subset: dict[str, dict] = {}
+        SHOW_FIRST_N = 10
         for subset in self.subsets:
             v_dir = self.handcrop_root / split / subset
             l_dir = self.landmark_root / split / subset
@@ -106,12 +110,18 @@ class WiTAPaperSplitDualDataset(Dataset):
 
             v_stems = {p.stem: p for p in sorted(v_dir.glob("*.npz"))}
             l_stems = {p.stem: p for p in sorted(l_dir.glob("*.npz"))}
+            miss_v: list[str] = []
+            miss_l: list[str] = []
 
             for stem in sorted(set(v_stems) | set(l_stems)):
-                if stem not in v_stems: missing_v += 1; continue
-                if stem not in l_stems: missing_l += 1; continue
+                if stem not in v_stems:
+                    miss_v.append(stem); continue
+                if stem not in l_stems:
+                    miss_l.append(stem); continue
                 if "__" not in stem:
-                    logger.warning("Unexpected stem %s; skipping.", stem); continue
+                    print(f"  [Stage12 dual {split}/{subset}] unexpected stem "
+                          f"{stem!r}; skipping.", flush=True)
+                    continue
                 signer_id, clip_id = stem.split("__", 1)
                 self.entries.append({
                     "video_path":    str(v_stems[stem]),
@@ -120,17 +130,54 @@ class WiTAPaperSplitDualDataset(Dataset):
                     "clip_id":       clip_id,
                     "subset":        subset,
                 })
+            miss_per_subset[subset] = {"video": miss_v, "landmark": miss_l}
 
         if not self.entries:
             raise RuntimeError(
                 f"No paired clips found under {handcrop_root} ∩ {landmark_root}"
                 f" for split={split} subsets={self.subsets}"
             )
-        if missing_v or missing_l:
-            logger.warning(
-                "[Stage12 dual %s] missing_video=%d  missing_landmark=%d",
-                split, missing_v, missing_l,
-            )
+
+        # Per-subset cache-mismatch report.  Distinguishes "whole signer
+        # dropped" (= regex / extractor bug) from "scattered per-clip
+        # failures" (= benign / MediaPipe).
+        total_miss_v = sum(len(d["video"])    for d in miss_per_subset.values())
+        total_miss_l = sum(len(d["landmark"]) for d in miss_per_subset.values())
+        if total_miss_v or total_miss_l:
+            print(f"\n[Stage12 dual {split}] cache-mismatch report:", flush=True)
+            print(f"  missing in handcrop cache (landmark-only): {total_miss_v}",
+                  flush=True)
+            print(f"  missing in landmark cache (handcrop-only): {total_miss_l}",
+                  flush=True)
+            for subset, d in miss_per_subset.items():
+                mv, ml = d["video"], d["landmark"]
+                if not (mv or ml): continue
+                print(f"  --- {split}/{subset} ---", flush=True)
+                if mv:
+                    print(f"    {len(mv)} missing in handcrop cache; first "
+                          f"{min(SHOW_FIRST_N, len(mv))}:", flush=True)
+                    for s in mv[:SHOW_FIRST_N]:
+                        print(f"      {s}", flush=True)
+                if ml:
+                    print(f"    {len(ml)} missing in landmark cache; first "
+                          f"{min(SHOW_FIRST_N, len(ml))}:", flush=True)
+                    for s in ml[:SHOW_FIRST_N]:
+                        print(f"      {s}", flush=True)
+            # Heuristic: if all missing stems share a signer prefix, it's a
+            # whole-signer drop -- almost certainly a bug worth fixing
+            # before training rather than tolerating.
+            for subset, d in miss_per_subset.items():
+                for side, stems in d.items():
+                    if not stems: continue
+                    signers = {s.split("__", 1)[0] for s in stems if "__" in s}
+                    if len(signers) <= 3 and len(stems) >= 20:
+                        print(f"\n  HEURISTIC WARNING: all {len(stems)} "
+                              f"{side}-side misses in {split}/{subset} come "
+                              f"from {len(signers)} signer(s): "
+                              f"{sorted(signers)}.  This looks like a "
+                              f"whole-signer drop -- verify the corresponding "
+                              f"cache wasn't extracted with the old regex.",
+                              flush=True)
         logger.info(
             "[Stage12 dual %s/%s] %d clips across %d signers",
             split, "+".join(self.subsets),
