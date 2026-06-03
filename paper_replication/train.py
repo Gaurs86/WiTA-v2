@@ -115,13 +115,27 @@ class Trainer:
         data_train = AirTypingDataset(self.opts, self.opts.data_path_train)
         data_val   = AirTypingDataset(self.opts, self.opts.data_path_val)
         # data_test held out -- evaluated EXACTLY ONCE post-training by eval_test.py.
+        #
+        # PERF: with AMP the fp16 GPU computes a batch in ~0.4s but then
+        # starves on the 4-vCPU JPEG-decode pipeline (effective throughput
+        # measured at ~6-9 ex/s vs ~19 ex/s instantaneous compute).  These
+        # knobs keep the GPU fed:
+        #   pin_memory          -> faster host->device copies
+        #   persistent_workers  -> don't respawn workers each epoch
+        #   prefetch_factor     -> each worker buffers several batches ahead
+        # num_workers can exceed the 4 cores because per-frame file reads are
+        # latency-bound (workers overlap I/O waits).
+        _nw = max(int(self.opts.num_workers), 0)
+        _dl = dict(collate_fn=pad_collate, pin_memory=True)
+        if _nw > 0:
+            _dl.update(persistent_workers=True, prefetch_factor=6)
         self.data_loader_train = DataLoader(
             data_train, batch_size=self.opts.batch_size, shuffle=True,
-            num_workers=self.opts.num_workers, collate_fn=pad_collate, drop_last=True,
+            num_workers=_nw, drop_last=True, **_dl,
         )
         self.data_loader_val = DataLoader(
             data_val, batch_size=self.opts.batch_size, shuffle=False,
-            num_workers=self.opts.num_workers, collate_fn=pad_collate, drop_last=True,
+            num_workers=_nw, drop_last=True, **_dl,
         )
 
         # ---- model ----
