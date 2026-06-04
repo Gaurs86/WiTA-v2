@@ -50,6 +50,58 @@ T_OUT = 24          # 8 tubes upsampled x3
 
 
 # ---------------------------------------------------------------------------
+# Augmentation — copied verbatim from the paper's video_transforms.py so the
+# Stage 14 augmentation is BYTE-IDENTICAL to Stage 13B's (R3D).  Clip-consistent
+# (same random params across all 16 frames).  PIL-only (no skimage dependency).
+# This keeps the encoder the only variable in the Stage14-vs-R3D comparison.
+# ---------------------------------------------------------------------------
+
+class _ClipColorJitter:
+    """Paper's ColorJitter for clips (list of PIL images).  Faithful copy,
+    including the original's shuffle-and-apply behaviour."""
+
+    def __init__(self, brightness=0, contrast=0, saturation=0, hue=0):
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+
+    def __call__(self, clip):
+        import torchvision.transforms.functional as F
+        b = random.uniform(max(0, 1 - self.brightness), 1 + self.brightness) if self.brightness > 0 else None
+        c = random.uniform(max(0, 1 - self.contrast),   1 + self.contrast)   if self.contrast > 0 else None
+        s = random.uniform(max(0, 1 - self.saturation), 1 + self.saturation) if self.saturation > 0 else None
+        h = random.uniform(-self.hue, self.hue) if self.hue > 0 else None
+        fns = []
+        if b is not None: fns.append(lambda im: F.adjust_brightness(im, b))
+        if s is not None: fns.append(lambda im: F.adjust_saturation(im, s))
+        if h is not None: fns.append(lambda im: F.adjust_hue(im, h))
+        if c is not None: fns.append(lambda im: F.adjust_contrast(im, c))
+        random.shuffle(fns)
+        out = []
+        for im in clip:
+            # Faithful to the paper: each fn operates on the original `im`
+            # and overwrites, so only the LAST shuffled op applies.  Kept
+            # exactly so Stage 14's augmentation == Stage 13B's (R3D).
+            jittered = im
+            for fn in fns:
+                jittered = fn(im)
+            out.append(jittered)
+        return out
+
+
+class _ClipRandomRotation:
+    """Paper's RandomRotation for clips (single random angle across the clip)."""
+
+    def __init__(self, degrees):
+        self.degrees = (-degrees, degrees) if isinstance(degrees, (int, float)) else degrees
+
+    def __call__(self, clip):
+        angle = random.uniform(self.degrees[0], self.degrees[1])
+        return [im.rotate(angle) for im in clip]
+
+
+# ---------------------------------------------------------------------------
 # Char <-> id
 # ---------------------------------------------------------------------------
 
@@ -116,6 +168,10 @@ class WiTAFullFrameDataset(Dataset):
         self.augment = augment
         self.t_in = t_in
         self.img_size = img_size
+        # Paper's augmentation (identical to Stage 13B): ColorJitter(0.5x4)
+        # + RandomRotation(5), clip-consistent.  Train only.
+        self._color_jitter = _ClipColorJitter(0.5, 0.5, 0.5, 0.5)
+        self._rotation = _ClipRandomRotation(5)
         self.entries = []
         root = Path(root)
         for subset in subsets:
@@ -156,7 +212,8 @@ class WiTAFullFrameDataset(Dataset):
     def __len__(self):
         return len(self.entries)
 
-    def _load_frames(self, clip_dir):
+    def _load_frames_pil(self, clip_dir):
+        """Return a list of T full-frame PIL images resized to 224x224 (no crop)."""
         files = sorted(f for f in os.listdir(clip_dir)
                        if f.lower().endswith((".jpg", ".jpeg", ".png")))
         if not files:
@@ -164,22 +221,19 @@ class WiTAFullFrameDataset(Dataset):
         n = len(files)
         sel = np.linspace(0, n - 1, self.t_in).round().astype(int)
         sel = np.clip(sel, 0, n - 1)
-        imgs = []
-        for i in sel:
-            img = Image.open(os.path.join(clip_dir, files[int(i)])).convert("RGB")
-            # FULL FRAME, NO CROP: resize the whole frame to square 224x224.
-            img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
-            imgs.append(np.asarray(img, dtype=np.uint8))
-        return np.stack(imgs)                                  # [T, 224, 224, 3] uint8
+        return [Image.open(os.path.join(clip_dir, files[int(i)])).convert("RGB")
+                .resize((self.img_size, self.img_size), Image.BILINEAR)
+                for i in sel]
 
     def __getitem__(self, idx):
         e = self.entries[idx]
-        frames = self._load_frames(e["dir"])
-        if self.augment and random.random() < 0.5:
-            # Mild brightness jitter, same factor across the clip (cheap).
-            bright = random.uniform(0.8, 1.2)
-            frames = np.clip(frames.astype(np.float32) * bright, 0, 255).astype(np.uint8)
-        x = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0   # [T,3,H,W]
+        pil = self._load_frames_pil(e["dir"])
+        if self.augment:
+            # Paper's augmentation (identical to Stage 13B / R3D), clip-consistent.
+            pil = self._color_jitter(pil)
+            pil = self._rotation(pil)
+        frames = np.stack([np.asarray(p, dtype=np.uint8) for p in pil])   # [T,224,224,3]
+        x = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0  # [T,3,H,W]
         x = (x - _MEAN) / _STD
         target = self.converter.encode(e["label"])
         return x, target
