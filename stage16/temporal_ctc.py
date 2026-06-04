@@ -189,7 +189,7 @@ def evaluate(model, loader, converter, device, use_amp=True):
         off = 0
         for b in range(len(subs)):
             L = int(tgt_lens[b])
-            gt = converter.decode_ctc(targets[off:off + L].tolist()); off += L
+            gt = converter.ids_to_text(targets[off:off + L].tolist()); off += L
             e, l = cer_pair(gt, preds[b])
             agg[subs[b]]["e"] += e; agg[subs[b]]["l"] += l
     cer = {s: agg[s]["e"] / max(agg[s]["l"], 1) for s in agg}
@@ -228,6 +228,7 @@ def train_ctc(data_root, cache_root, *, out_dir, backbone="bilstm", d_model=256,
     best = float("inf"); best_payload = {}
     for ep in range(epochs):
         model.train(); t0 = time.time(); losses = []
+        tr_e = tr_l = 0
         for feats, targets, in_lens, tgt_lens, _, _ in trl:
             feats = feats.to(device); targets = targets.to(device)
             opt.zero_grad()
@@ -240,8 +241,23 @@ def train_ctc(data_root, cache_root, *, out_dir, backbone="bilstm", d_model=256,
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt); scaler.update(); sched.step()
             losses.append(float(loss.item()))
+            # TRAIN-CER diagnostic (greedy).  Decisive: if train_cer -> ~0 while
+            # val stays high, the model fits train but CLIP features don't
+            # generalize across signers; if train_cer stays high, the features
+            # lack the trajectory signal (feature-limited) and more epochs cannot
+            # help.  Only the small argmax is moved to CPU, so overhead is tiny.
+            with torch.no_grad():
+                am = lp.argmax(-1).cpu()
+                tgt_cpu = targets.detach().cpu().tolist()
+                off = 0
+                for b in range(am.shape[0]):
+                    pred = converter.decode_ctc(am[b, :int(in_lens[b])].tolist())
+                    L = int(tgt_lens[b])
+                    gt = converter.ids_to_text(tgt_cpu[off:off + L]); off += L
+                    e, l = cer_pair(gt, pred); tr_e += e; tr_l += l
+        tr_cer = tr_e / max(tr_l, 1)
         cer = evaluate(model, val, converter, device, use_amp=use_amp)
-        print(f"E{ep:3d}/{epochs} loss={np.mean(losses):.4f} "
+        print(f"E{ep:3d}/{epochs} loss={np.mean(losses):.4f} train_cer={tr_cer:.4f} "
               f"val overall={cer['overall']:.4f} lex={cer['lex']:.4f} "
               f"nonlex={cer['nonlex']:.4f}  {time.time()-t0:.0f}s", flush=True)
         if cer["overall"] < best:

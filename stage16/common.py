@@ -50,6 +50,13 @@ class CharConverter:
             prev = i
         return "".join(out)
 
+    def ids_to_text(self, ids) -> str:
+        """Map raw label ids -> text WITHOUT CTC collapse (for reconstructing a
+        ground-truth string from encoded targets).  decode_ctc must NOT be used
+        for this: it collapses consecutive repeats, so 'letter' -> 'leter'."""
+        return "".join(self.alphabet[int(i) - 1] for i in ids
+                       if 0 < int(i) <= len(self.alphabet))
+
     @property
     def pyctc_labels(self) -> list[str]:
         """pyctcdecode labels: index 0 = blank ('' empty string), then a..z.
