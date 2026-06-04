@@ -99,8 +99,13 @@ def extract_split(data_root, cache_root, split, subset, t=32, batch=64,
                 chunk = imgs[s:s + batch]
                 px = proc(images=chunk, return_tensors="pt")["pixel_values"].to(device)
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    f = model.get_image_features(pixel_values=px)     # [n, 512]
-                feats.append(f.float().cpu())
+                    # Build the CLIP image embedding explicitly (vision tower ->
+                    # visual projection).  This is exactly what get_image_features
+                    # does, but returns a plain tensor across transformers versions
+                    # (some return a BaseModelOutputWithPooling object).
+                    vout = model.vision_model(pixel_values=px)
+                    emb = model.visual_projection(vout.pooler_output)  # [n, 512]
+                feats.append(emb.float().cpu())
             arr = torch.cat(feats, 0).numpy().astype(np.float16)       # [T, 512]
             tmp = str(out_npy) + ".tmp.npy"
             np.save(tmp, arr); os.replace(tmp, out_npy)
@@ -108,6 +113,14 @@ def extract_split(data_root, cache_root, split, subset, t=32, batch=64,
         except Exception as ex:
             n_skipped += 1
             print(f"  skip {e['dir']}: {type(ex).__name__}: {ex}", flush=True)
+            # Fail fast on a SYSTEMATIC bug: if the first few clips all error
+            # with nothing written, it's a code bug, not bad data -- don't
+            # silently skip all 10K clips.
+            if n_written == 0 and n_existed == 0 and n_skipped >= 3:
+                raise RuntimeError(
+                    f"First {n_skipped} clips all failed with nothing written -- "
+                    f"likely a systematic bug, not bad data. Last error: "
+                    f"{type(ex).__name__}: {ex}") from ex
         if (ci + 1) % 200 == 0 or (ci + 1) == len(clips):
             el = time.time() - t0
             rate = (ci + 1) / max(el, 1e-3)
