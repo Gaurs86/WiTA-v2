@@ -166,35 +166,50 @@ def evaluate(opts):
 
 
 if __name__ == "__main__":
-    opts = AirTypingOptions().parse()
+    _opts_obj = AirTypingOptions()
+    # --eval_split controls the one-shot discipline:
+    #   val  -> diagnostic, NO marker, can run freely (the playground).
+    #   test -> the one-shot headline, marker-gated.
+    # Point --data_path_test at whichever split you pass here.
+    _opts_obj.parser.add_argument("--eval_split", type=str, default="test",
+                                  choices=["val", "test"],
+                                  help="'val' = free diagnostic (no marker); "
+                                       "'test' = one-shot headline (marker-gated)")
+    opts = _opts_obj.parse()
+    split = opts.eval_split
 
     out_dir = opts.load_dir
-    marker = os.path.join(out_dir, ".stage13b_test_evaluated")
-    if os.path.exists(marker):
+    marker = os.path.join(out_dir, f".stage13b_{split}_evaluated")
+    if split == "test" and os.path.exists(marker):
         print(f"ERROR: test already evaluated.  Marker: {marker}", file=sys.stderr)
         print("Per the §7 contract the test set is evaluated exactly once.", file=sys.stderr)
         print("If you intentionally need to re-run, delete the marker manually.", file=sys.stderr)
         sys.exit(2)
 
+    decode = "ctc" if opts.loss_type == "ctc" or not opts.use_joint_decoder else "attn"
     result = evaluate(opts)
+    result["eval_split"] = split
+    result["decode"] = decode
 
     headline = {k: v for k, v in result.items() if k != 'pairs_all'}
-    head_path = os.path.join(out_dir, f"test_eval_{opts.model_name}.json")
-    full_path = os.path.join(out_dir, f"test_eval_{opts.model_name}_full.json")
+    tag = f"{split}_{decode}_{opts.model_name}"
+    head_path = os.path.join(out_dir, f"eval_{tag}.json")
+    full_path = os.path.join(out_dir, f"eval_{tag}_full.json")
     with open(head_path, 'w') as f:
         json.dump(headline, f, indent=2, default=float)
     with open(full_path, 'w') as f:
         json.dump(result, f, indent=2, default=float)
-    with open(marker, 'w') as f:
-        f.write(head_path)
+    if split == "test":
+        with open(marker, 'w') as f:
+            f.write(head_path)
 
     h = headline
     print("\n" + "=" * 64)
-    print(f"  STAGE 13B TEST HEADLINE  (written to {head_path})")
+    print(f"  STAGE 13B {split.upper()} ({decode} decode)  -> {head_path}")
     print("=" * 64)
-    print(f"  test_overall_cer : {h['test_overall_cer']:.4f}   (paper: 0.2924)")
-    print(f"  test_lex_cer     : {h['test_lex_cer']:.4f}       (paper: 0.281)")
-    print(f"  test_nonlex_cer  : {h['test_nonlex_cer']:.4f}     (paper: 0.365)")
+    print(f"  overall_cer : {h['test_overall_cer']:.4f}   (paper: 0.2924)")
+    print(f"  lex_cer     : {h['test_lex_cer']:.4f}       (paper: 0.281)")
+    print(f"  nonlex_cer  : {h['test_nonlex_cer']:.4f}     (paper: 0.365)")
     print("=" * 64)
     print(f"  per-length CER : {h['per_length_cer']}")
     print(f"  n_test_clips   : {h['n_test_clips']}  ({h['n_clips_per_subset']})")
