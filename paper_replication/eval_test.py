@@ -166,16 +166,17 @@ def evaluate(opts):
 
 
 if __name__ == "__main__":
-    _opts_obj = AirTypingOptions()
-    # --eval_split controls the one-shot discipline:
-    #   val  -> diagnostic, NO marker, can run freely (the playground).
+    import argparse as _ap
+    # Parse base args; collect --eval_split as "unrecognized", parse it
+    # separately.  Robust against base-parser-extension fragility.
+    #   val  -> diagnostic, NO marker, run freely (the playground).
     #   test -> the one-shot headline, marker-gated.
-    # Point --data_path_test at whichever split you pass here.
-    _opts_obj.parser.add_argument("--eval_split", type=str, default="test",
-                                  choices=["val", "test"],
-                                  help="'val' = free diagnostic (no marker); "
-                                       "'test' = one-shot headline (marker-gated)")
-    opts = _opts_obj.parse()
+    _opts_obj = AirTypingOptions()
+    opts, _extra = _opts_obj.parser.parse_known_args()
+    _ep = _ap.ArgumentParser()
+    _ep.add_argument("--eval_split", type=str, default="test", choices=["val", "test"])
+    _mine = _ep.parse_args(_extra)
+    opts.eval_split = _mine.eval_split
     split = opts.eval_split
 
     out_dir = opts.load_dir

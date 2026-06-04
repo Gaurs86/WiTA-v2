@@ -219,14 +219,20 @@ def run(opts, split, lexicon):
 
 
 if __name__ == "__main__":
+    import argparse as _ap
+    # Parse base AirTypingOptions args, collecting our extra flags as
+    # "unrecognized", then parse those with a separate parser.  This avoids
+    # any fragility in extending the base parser after construction.
     o = AirTypingOptions()
-    o.parser.add_argument("--eval_split", type=str, default="val",
-                          choices=["val", "test"],
-                          help="val=free diagnostic; test=one-shot (marker-gated)")
-    o.parser.add_argument("--train_root", type=str, required=True,
-                          help="path to english/train (for building the lexicon)")
-    o.parser.add_argument("--len_window", type=int, default=5)
-    opts = o.parse()
+    opts, _extra = o.parser.parse_known_args()
+    _ep = _ap.ArgumentParser()
+    _ep.add_argument("--eval_split", type=str, default="val", choices=["val", "test"])
+    _ep.add_argument("--train_root", type=str, required=True)
+    _ep.add_argument("--len_window", type=int, default=5)
+    _mine = _ep.parse_args(_extra)
+    opts.eval_split = _mine.eval_split
+    opts.train_root = _mine.train_root
+    opts.len_window = _mine.len_window
     split = opts.eval_split
 
     marker = os.path.join(opts.load_dir, f".stage13b_lexicon_{split}_evaluated")
