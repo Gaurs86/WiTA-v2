@@ -190,6 +190,17 @@ class Trainer:
 
         # ---- losses ----
         self.ctc_loss = torch.nn.CTCLoss(reduction='mean', zero_infinity=True)
+        # Focal CTC (Feng et al. 2019): down-weights confident/frequent samples
+        # so the model attends more to low-frequency characters.  English
+        # letter frequency is highly skewed, so this targets the lex subset.
+        #   L_focal = alpha * (1 - p)^gamma * L_ctc,   p = exp(-L_ctc)
+        # gamma=0 reduces to standard CTC (x alpha).  Needs per-sample losses.
+        self.focal_gamma = float(getattr(self.opts, 'focal_gamma', 0.0))
+        self.focal_alpha = float(getattr(self.opts, 'focal_alpha', 1.0))
+        self.use_focal = self.focal_gamma > 0.0
+        self.ctc_loss_none = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
+        if self.use_focal:
+            self.logger.info(f"Focal CTC ON: alpha={self.focal_alpha} gamma={self.focal_gamma}")
 
         # ---- mixed precision ----
         # r3d_18 in fp32 on a single GPU is ~2x slower than fp16 tensor
@@ -253,7 +264,13 @@ class Trainer:
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
                     ctc_logits, _ = self.model(xx_pad, x_lens)
                 ctc_log_probs = ctc_logits.float().permute(1, 0, 2).log_softmax(-1)
-                loss = self.ctc_loss(ctc_log_probs, yy_pad, x_lens, y_lens)
+                if self.use_focal:
+                    # Focal CTC: alpha * (1 - p)^gamma * L,  p = exp(-L), per sample.
+                    per = self.ctc_loss_none(ctc_log_probs, yy_pad, x_lens, y_lens)  # [B]
+                    p = torch.exp(-per).clamp(max=1.0)
+                    loss = (self.focal_alpha * (1.0 - p) ** self.focal_gamma * per).mean()
+                else:
+                    loss = self.ctc_loss(ctc_log_probs, yy_pad, x_lens, y_lens)
                 ctc_loss = loss
                 attn_loss = torch.tensor(0.0, device=self.device)
 

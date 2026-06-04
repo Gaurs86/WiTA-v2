@@ -120,6 +120,12 @@ class AirTypingOptions:
                                  help="mixed-precision training (fp16 autocast + GradScaler). "
                                       "~2x faster + ~half memory on a single GPU.  CTC/CE "
                                       "losses still computed in fp32 for stability.")
+        # Focal CTC (Feng et al. 2019): L_focal = alpha*(1-p)^gamma*L_ctc.
+        # gamma=0 -> standard CTC.  Targets low-frequency characters.
+        self.parser.add_argument("--focal_gamma",          type=float, default=0.0,
+                                 help="Focal CTC gamma (0 = standard CTC; try 0.5-2.0)")
+        self.parser.add_argument("--focal_alpha",          type=float, default=1.0,
+                                 help="Focal CTC alpha scaling")
         self.parser.add_argument("--cache_dir",            type=str, default='',
                                  help="dir of pre-decoded uint8 frame caches (built by "
                                       "build_cache.py).  CER-neutral: stores the exact "
