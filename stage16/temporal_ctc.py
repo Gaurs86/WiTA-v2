@@ -229,6 +229,7 @@ def train_ctc(data_root, cache_root, *, out_dir, backbone="bilstm", d_model=256,
     for ep in range(epochs):
         model.train(); t0 = time.time(); losses = []
         tr_e = tr_l = 0
+        seen = 0; samp_gt = samp_pred = ""          # one reservoir-sampled example
         for feats, targets, in_lens, tgt_lens, _, _ in trl:
             feats = feats.to(device); targets = targets.to(device)
             opt.zero_grad()
@@ -255,11 +256,16 @@ def train_ctc(data_root, cache_root, *, out_dir, backbone="bilstm", d_model=256,
                     L = int(tgt_lens[b])
                     gt = converter.ids_to_text(tgt_cpu[off:off + L]); off += L
                     e, l = cer_pair(gt, pred); tr_e += e; tr_l += l
+                    seen += 1                       # reservoir-sample 1 example/epoch
+                    if random.random() < 1.0 / seen:
+                        samp_gt, samp_pred = gt, pred
         tr_cer = tr_e / max(tr_l, 1)
+        lr_now = opt.param_groups[0]["lr"]
         cer = evaluate(model, val, converter, device, use_amp=use_amp)
         print(f"E{ep:3d}/{epochs} loss={np.mean(losses):.4f} train_cer={tr_cer:.4f} "
-              f"val overall={cer['overall']:.4f} lex={cer['lex']:.4f} "
+              f"lr={lr_now:.2e} val overall={cer['overall']:.4f} lex={cer['lex']:.4f} "
               f"nonlex={cer['nonlex']:.4f}  {time.time()-t0:.0f}s", flush=True)
+        print(f"      ex  gt='{samp_gt}'  ctc='{samp_pred}'", flush=True)
         if cer["overall"] < best:
             best = cer["overall"]
             best_payload = {"epoch": ep, **cer}
