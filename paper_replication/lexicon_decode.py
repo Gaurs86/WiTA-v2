@@ -92,13 +92,16 @@ def ctc_logp(log_probs: np.ndarray, target, blank: int = 0) -> float:
 # Lexicon
 # ---------------------------------------------------------------------------
 
-def build_lexicon(train_root, converter):
-    """Unique lowercased lex words from TRAIN gt.txt files + their encodings."""
+def build_lexicon(train_root, converter, wordfreq_topk=0):
+    """Lexicon = TRAIN lex words (+ optionally the wordfreq_topk most frequent
+    English words, an external prior with NO test-label leakage).  Returns a
+    dict keyed by first character -> list of (word, encoded_ids, len) for fast
+    candidate pruning, plus the flat word set for coverage reporting."""
     words = set()
-    base = Path(train_root)            # e.g. .../english/train
+    base = Path(train_root)
     lex = base / "lex"
     if not lex.exists():
-        lex = base                      # mounts that flatten the subset layer
+        lex = base
     for gt in lex.rglob("gt.txt"):
         try:
             for line in open(gt, "r", encoding="utf-8", errors="replace"):
@@ -107,11 +110,25 @@ def build_lexicon(train_root, converter):
                     words.add(w)
         except Exception:
             continue
-    lexicon = []
+    n_train = len(words)
+    if wordfreq_topk > 0:
+        try:
+            from wordfreq import top_n_list
+            for w in top_n_list("en", wordfreq_topk):
+                w = w.strip().lower()
+                if w.isalpha() and 1 <= len(w) <= 20:
+                    words.add(w)
+            print(f"[lexicon] train words={n_train}  + wordfreq top {wordfreq_topk} "
+                  f"-> {len(words)} total", flush=True)
+        except ImportError:
+            print("[lexicon] wordfreq not installed (pip install wordfreq); "
+                  "using TRAIN words only.", flush=True)
+    by_fc = {}
     for w in sorted(words):
         enc, _ = converter.encode(w)
-        lexicon.append((w, [int(x) for x in enc.tolist()]))
-    return lexicon
+        ids = [int(x) for x in enc.tolist()]
+        by_fc.setdefault(w[0], []).append((w, ids, len(w)))
+    return by_fc, words
 
 
 def greedy_decode(log_probs, converter, blank=0):
@@ -124,24 +141,34 @@ def greedy_decode(log_probs, converter, blank=0):
     return "".join(out).replace("-", "")
 
 
-def lexicon_decode(log_probs, lexicon, greedy_str, blank=0, len_window=5):
-    """Argmax over lexicon of ctc_logp.  Prunes to words whose length is
-    within len_window of the greedy prediction (speed; safe for a strong
-    model whose greedy length is usually close)."""
+def lexicon_decode(log_probs, by_fc, greedy_str, converter, blank=0, len_window=4):
+    """Lexicon-constrained decode with SOFT FALLBACK.
+
+    Candidates = greedy string itself + lexicon words sharing the greedy's
+    first character and within len_window of its length.  Pick the highest
+    CTC-probability candidate.  Because greedy is always a candidate, the
+    result is never less probable than greedy -> lexicon decoding can only
+    help, never hurt (monotone).
+    """
     gl = len(greedy_str)
-    best_w, best_s = None, -math.inf
-    for w, enc in lexicon:
-        if abs(len(w) - gl) > len_window:
+    # Greedy is always a candidate (soft fallback).
+    g_enc, _ = converter.encode(greedy_str)
+    best_w = greedy_str
+    best_s = ctc_logp(log_probs, [int(x) for x in g_enc.tolist()], blank)
+    if gl == 0:
+        return best_w
+    for w, ids, wl in by_fc.get(greedy_str[0], ()):
+        if abs(wl - gl) > len_window:
             continue
-        s = ctc_logp(log_probs, enc, blank)
+        s = ctc_logp(log_probs, ids, blank)
         if s > best_s:
             best_s, best_w = s, w
-    return best_w if best_w is not None else greedy_str
+    return best_w
 
 
 # ---------------------------------------------------------------------------
 
-def run(opts, split, lexicon):
+def run(opts, split, by_fc, lex_words):
     device = torch.device("cuda" if torch.cuda.is_available() and not opts.no_cuda else "cpu")
     converter = utils.StrLabelConverter(utils.ALPHABET)
 
@@ -150,18 +177,14 @@ def run(opts, split, lexicon):
     ckpt = os.path.join(opts.load_dir, "model.pth")
     state = torch.load(ckpt, map_location=device)
     model.load_state_dict(state, strict=False)
-    print(f"[lexicon_decode] loaded {ckpt}  | lexicon={len(lexicon)} words", flush=True)
-
-    # Coverage: fraction of this split's lex words present in the lexicon.
-    lex_words = {w for w, _ in lexicon}
-    split_lex_words, covered = set(), 0
-    for e in data.entries if hasattr(data, "entries") else []:
-        pass
+    print(f"[lexicon_decode] loaded {ckpt}  | lexicon={len(lex_words)} words", flush=True)
 
     agg = {m: {sub: {"e": 0, "l": 0, "n": 0} for sub in ("lex", "nonlex")}
            for m in ("greedy", "lexicon")}
     n = len(data.video_list)
-    miss_cov = 0
+    miss_cov = 0          # lex GT words not in the lexicon
+    n_override = 0        # times lexicon changed the greedy output (lex only)
+    lw = int(getattr(opts, "len_window", 4))
     with torch.no_grad():
         for idx in range(n):
             vpath = data.video_list[idx]
@@ -176,7 +199,9 @@ def run(opts, split, lexicon):
             if subset == "lex":
                 if gt not in lex_words:
                     miss_cov += 1
-                lx = lexicon_decode(log_probs, lexicon, g)
+                lx = lexicon_decode(log_probs, by_fc, g, converter, len_window=lw)
+                if lx != g:
+                    n_override += 1
             else:
                 lx = g                                            # lexicon n/a
 
@@ -199,9 +224,10 @@ def run(opts, split, lexicon):
     n_lex = agg["greedy"]["lex"]["n"]
     result = {
         "eval_split": split,
-        "lexicon_size": len(lexicon),
+        "lexicon_size": len(lex_words),
         "lex_coverage": 1.0 - miss_cov / max(n_lex, 1),
         "n_lex_words_not_in_lexicon": miss_cov,
+        "n_lex_overridden_by_lexicon": n_override,
         "greedy": {
             "lex_cer": cer(agg["greedy"], "lex"),
             "nonlex_cer": cer(agg["greedy"], "nonlex"),
@@ -228,7 +254,10 @@ if __name__ == "__main__":
     _ep = _ap.ArgumentParser()
     _ep.add_argument("--eval_split", type=str, default="val", choices=["val", "test"])
     _ep.add_argument("--train_root", type=str, required=True)
-    _ep.add_argument("--len_window", type=int, default=5)
+    _ep.add_argument("--len_window", type=int, default=4)
+    _ep.add_argument("--wordfreq_topk", type=int, default=0,
+                     help="add the top-K frequent English words to the lexicon "
+                          "(needs `pip install wordfreq`; 0 = train words only)")
     _mine = _ep.parse_args(_extra)
     opts.eval_split = _mine.eval_split
     opts.train_root = _mine.train_root
@@ -241,8 +270,9 @@ if __name__ == "__main__":
         sys.exit(2)
 
     converter = utils.StrLabelConverter(utils.ALPHABET)
-    lexicon = build_lexicon(opts.train_root, converter)
-    res = run(opts, split, lexicon)
+    by_fc, lex_words = build_lexicon(opts.train_root, converter,
+                                     wordfreq_topk=_mine.wordfreq_topk)
+    res = run(opts, split, by_fc, lex_words)
 
     out = os.path.join(opts.load_dir, f"lexicon_{split}_{opts.model_name}.json")
     with open(out, "w") as f:
