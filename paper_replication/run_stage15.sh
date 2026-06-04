@@ -16,13 +16,15 @@ DATA_ROOT="${DATA_ROOT:-$HOME/wita-data/english}"
 CACHE_DIR="${CACHE_DIR:-$HOME/wita-cache}"
 SAVE_NAME="${SAVE_NAME:-stage15_focalctc}"
 BATCH="${BATCH:-8}"
-EPOCHS="${EPOCHS:-120}"        # ~8 min/epoch with cache -> ~16h -> ~$5-6
+EPOCHS="${EPOCHS:-80}"         # converges well before 120; ~7 min/epoch with cache + fast CTC val -> ~10h -> ~$3.5
 LR="${LR:-1e-3}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 MAX_FRAMES="${MAX_FRAMES:-64}" # reuse the existing cache (built at 64)
 USE_AMP="${USE_AMP:-True}"
-FOCAL_GAMMA="${FOCAL_GAMMA:-1.0}"   # 0 = standard CTC; 1.0 a safe default, tune on val
-FOCAL_ALPHA="${FOCAL_ALPHA:-1.0}"
+# Focal CTC params from Feng et al. 2019's recommendation for unbalanced
+# data (alpha=0.25, gamma=0.5).  gamma=2 hurt in their Fig 7 -- avoid.
+FOCAL_GAMMA="${FOCAL_GAMMA:-0.5}"
+FOCAL_ALPHA="${FOCAL_ALPHA:-0.25}"
 
 export PYTHONHASHSEED=0
 mkdir -p logs
