@@ -32,7 +32,10 @@ from utils   import (WarmupMultiStepLR, Lamb, sec_to_hm_str, cer,
 
 
 options = AirTypingOptions()
-opts = options.parse()
+# parse_known_args: this runs at IMPORT time and pad_collate reads the
+# module-level `opts`.  Tolerate extra CLI flags so eval scripts that
+# import pad_collate (and add their own flags) don't choke at import.
+opts, _unused_extra_args = options.parser.parse_known_args()
 
 
 # ----------------------------------------------------------------------

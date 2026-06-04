@@ -6,8 +6,12 @@ import torch.nn as nn
 from options import AirTypingOptions
 
 
+# NOTE: this parse runs at IMPORT time (resnet3d reads a global `opts` for
+# its forward logic).  Use parse_known_args so importing this module from a
+# script that adds its OWN CLI flags (e.g. eval_test.py / lexicon_decode.py
+# with --eval_split, --train_root) doesn't choke on those extra args.
 options = AirTypingOptions()
-opts = options.parse()
+opts, _unused_extra_args = options.parser.parse_known_args()
 
 __all__ = ['r2d', 'r3d', 'mc3', 'rmc3', 'r2plus1d']
 TRACK_RUNNING = opts.track_running
