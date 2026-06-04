@@ -116,19 +116,29 @@ def build_lexicon(train_root, converter, wordfreq_topk=0):
             from wordfreq import top_n_list
             for w in top_n_list("en", wordfreq_topk):
                 w = w.strip().lower()
-                if w.isalpha() and 1 <= len(w) <= 20:
+                # ASCII a-z only: the CTC vocab has no accents/apostrophes.
+                if w.isascii() and w.isalpha() and 1 <= len(w) <= 20:
                     words.add(w)
             print(f"[lexicon] train words={n_train}  + wordfreq top {wordfreq_topk} "
-                  f"-> {len(words)} total", flush=True)
+                  f"-> {len(words)} candidate words", flush=True)
         except ImportError:
             print("[lexicon] wordfreq not installed (pip install wordfreq); "
                   "using TRAIN words only.", flush=True)
-    by_fc = {}
+    # Keep only words encodable in the a-z(+ '-') vocab; skip anything else.
+    alpha = set(converter.alphabet)
+    by_fc, kept = {}, set()
     for w in sorted(words):
-        enc, _ = converter.encode(w)
+        if not w or any(c not in alpha for c in w):
+            continue
+        try:
+            enc, _ = converter.encode(w)
+        except Exception:
+            continue
         ids = [int(x) for x in enc.tolist()]
         by_fc.setdefault(w[0], []).append((w, ids, len(w)))
-    return by_fc, words
+        kept.add(w)
+    print(f"[lexicon] {len(kept)} encodable words retained", flush=True)
+    return by_fc, kept
 
 
 def greedy_decode(log_probs, converter, blank=0):
