@@ -134,6 +134,49 @@ def temporal_crop_resize(
 # Composed augmenter
 # ---------------------------------------------------------------------------
 
+def spatial_affine(
+    feats: torch.Tensor,
+    max_rot_deg: float = 15.0,
+    scale_min:   float = 0.85,
+    scale_max:   float = 1.15,
+    max_shear:   float = 0.10,
+    max_aspect:  float = 0.10,
+) -> torch.Tensor:
+    """Random 2D affine (rotation / scale / shear / aspect) on the (x, y) of the
+    21 landmarks.  The SAME linear map M is applied to position, velocity AND
+    acceleration channels -- consistent because vel/acc are differences of
+    position, so M(dp) = d(M p).  Positions are rotated about the per-clip hand
+    centre (writing stays on-canvas); vel/acc are differences so need no
+    centring.  z and the visibility channel are untouched.  Targets the
+    cross-signer slant/size/aspect variation that Stage 11's warp+jitter did
+    NOT cover (the 0.085->0.652 per-signer spread)."""
+    import math
+    T, D = feats.shape
+    th = (torch.rand(1).item() * 2 - 1) * math.radians(max_rot_deg)
+    s  = scale_min + torch.rand(1).item() * (scale_max - scale_min)
+    sh = (torch.rand(1).item() * 2 - 1) * max_shear
+    ar = 1.0 + (torch.rand(1).item() * 2 - 1) * max_aspect
+    c, sn = math.cos(th), math.sin(th)
+    R  = torch.tensor([[c, -sn], [sn, c]])
+    Sc = torch.tensor([[s * ar, 0.0], [0.0, s / ar]])
+    Sh = torch.tensor([[1.0, sh], [0.0, 1.0]])
+    M  = (R @ Sc @ Sh).to(feats.dtype)                          # [2, 2]
+    out = feats.clone()
+    if D < 63:
+        return out
+    pos = out[:, 0:63].reshape(T, 21, 3)                        # position block
+    mean_xy = pos[..., :2].reshape(-1, 2).mean(0)
+    pos[..., :2] = torch.einsum('tjc,dc->tjd', pos[..., :2] - mean_xy, M) + mean_xy
+    out[:, 0:63] = pos.reshape(T, 63)
+    for base in (63, 126):                                      # velocity, accel
+        if base + 63 > D - 1:                                  # leave visibility col
+            break
+        blk = out[:, base:base + 63].reshape(T, 21, 3)
+        blk[..., :2] = torch.einsum('tjc,dc->tjd', blk[..., :2], M)
+        out[:, base:base + 63] = blk.reshape(T, 63)
+    return out
+
+
 class LandmarkAugment:
     """
     Composable per-clip augmenter for the SkeletonDataset.
@@ -165,6 +208,12 @@ class LandmarkAugment:
         p_temporal_crop:   float = 0.50,
         temporal_crop_min: float = 0.60,
         temporal_crop_max: float = 1.00,
+        p_spatial_affine:  float = 0.0,    # OFF by default -> baseline unchanged
+        affine_rot_deg:    float = 15.0,
+        affine_scale_min:  float = 0.85,
+        affine_scale_max:  float = 1.15,
+        affine_shear:      float = 0.10,
+        affine_aspect:     float = 0.10,
         seed:              Optional[int] = None,
     ):
         self.p_warp   = p_temporal_warp
@@ -174,11 +223,23 @@ class LandmarkAugment:
         self.p_crop   = p_temporal_crop
         self.crop_min = temporal_crop_min
         self.crop_max = temporal_crop_max
+        self.p_affine    = p_spatial_affine
+        self.aff_rot     = affine_rot_deg
+        self.aff_smin     = affine_scale_min
+        self.aff_smax     = affine_scale_max
+        self.aff_shear   = affine_shear
+        self.aff_aspect  = affine_aspect
         # Per-worker RNG; if seed given, use it.  Otherwise leave to global.
         self._gen = torch.Generator() if seed is None else \
                     torch.Generator().manual_seed(seed)
 
     def __call__(self, feats: torch.Tensor) -> torch.Tensor:
+        if self.p_affine > 0 and torch.rand(1).item() < self.p_affine:
+            feats = spatial_affine(
+                feats, max_rot_deg=self.aff_rot,
+                scale_min=self.aff_smin, scale_max=self.aff_smax,
+                max_shear=self.aff_shear, max_aspect=self.aff_aspect,
+            )
         if torch.rand(1).item() < self.p_warp:
             feats = temporal_warp(feats, max_warp=self.warp_max)
         if torch.rand(1).item() < self.p_jitter:
