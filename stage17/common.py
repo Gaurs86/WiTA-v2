@@ -89,15 +89,24 @@ def iter_clips(cache_root: str, split: str, subsets=("lex", "nonlex")) -> list[d
     return out
 
 
-def find_landmark_cache(default="/kaggle/working/landmark_cache_122") -> str:
-    """Locate the landmark cache root (working dir, then any /kaggle/input mount)."""
-    if os.path.isdir(os.path.join(default, "train")):
-        return default
-    base = "/kaggle/input"
-    if os.path.isdir(base):
-        for c in os.listdir(base):
-            for cand in (os.path.join(base, c),
-                         os.path.join(base, c, "landmark_cache_122")):
-                if os.path.isdir(os.path.join(cand, "train")):
-                    return cand
-    return default
+def find_landmark_cache(preferred=None) -> str:
+    """Locate the per-clip landmark cache root: a directory holding
+    train/{lex,nonlex}/*.npz.  Checks `preferred` paths first, then the known
+    Kaggle dataset mount, then a bounded recursive probe (handles an extra
+    landmark_cache_122/ nesting level if the dataset was zipped with it)."""
+    import glob
+    cands = list(preferred or [])
+    cands += [
+        "/kaggle/input/datasets/gaurs86/wita-full-english-landmark-cache",
+        "/kaggle/working/landmark_cache_122",
+    ]
+    probe = []
+    for c in cands:
+        probe += [c, os.path.join(c, "landmark_cache_122")]
+    for c in probe:
+        if glob.glob(os.path.join(c, "train", "*", "*.npz")):
+            return c
+    hits = glob.glob("/kaggle/input/**/train/lex/*.npz", recursive=True)
+    if hits:                                   # root is 3 levels up from the npz
+        return os.path.dirname(os.path.dirname(os.path.dirname(hits[0])))
+    return cands[0]
