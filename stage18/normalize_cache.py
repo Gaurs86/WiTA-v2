@@ -54,7 +54,9 @@ def reprocess_cache(src_root: str, dst_root: str) -> int:
     from stage17.common import iter_clips
     n = 0
     for split in ("train", "val", "test"):
-        for c in iter_clips(src_root, split, ("lex", "nonlex")):
+        clips = iter_clips(src_root, split, ("lex", "nonlex"))
+        print(f"  [{split}] {len(clips)} clips...", flush=True)
+        for c in clips:
             d = np.load(c["npz"], allow_pickle=True)
             feat = normalize_feature(d["feature"].astype(np.float32))
             outdir = os.path.join(dst_root, split, c["subset"])
@@ -64,7 +66,9 @@ def reprocess_cache(src_root: str, dst_root: str) -> int:
                      signer=d["signer"], subset=d["subset"],
                      clip_id=d["clip_id"], detected=d["detected"])
             n += 1
-        print(f"  [{split}] reprocessed (running total {n})", flush=True)
+            if n % 1000 == 0:
+                print(f"    reprocessed {n} clips", flush=True)
+        print(f"  [{split}] done (running total {n})", flush=True)
     print(f"[normalize_cache] wrote {n} normalized clips -> {dst_root}", flush=True)
     return n
 
