@@ -263,6 +263,106 @@ def evaluate_split(model, cache_root, split, converter, by_fc, lex_words, device
     }
 
 
+def build_flat_lexicon(words, converter):
+    """Flat lexicon [(word, ids, len)] over an arbitrary word set (for the
+    coverage ceiling / external-list experiments).  Not first-char bucketed:
+    candidates come from edit distance, so a wrong-first-char CTC error
+    (which Stage 17b excluded) can still reach the right word."""
+    alpha = set(converter.alphabet)
+    out = []
+    for w in sorted(set(w.strip().lower() for w in words)):
+        if w and not any(c not in alpha for c in w):
+            out.append((w, converter.encode(w), len(w)))
+    return out
+
+
+def lexicon_decode_ed(log_probs, flat_lex, greedy_str, converter, blank=0,
+                      max_ed=2, topk=40):
+    """Candidates = lexicon words within edit distance `max_ed` of the greedy
+    string (length-prefiltered, top-`topk` nearest), rescored by CTC forward.
+    Soft fallback: greedy is always a candidate -> monotone (can only help)."""
+    import editdistance
+    if not greedy_str:
+        return greedy_str
+    gl = len(greedy_str)
+    scored = []
+    for w, ids, wl in flat_lex:
+        if abs(wl - gl) > max_ed + 1:
+            continue
+        ed = editdistance.eval(greedy_str, w)
+        if ed <= max_ed:
+            scored.append((ed, w, ids))
+    scored.sort(key=lambda x: x[0])
+    best_w = greedy_str
+    best_s = ctc_logp(log_probs, converter.encode(greedy_str), blank)
+    for ed, w, ids in scored[:topk]:
+        s = ctc_logp(log_probs, ids, blank)
+        if s > best_s:
+            best_s, best_w = s, w
+    return best_w
+
+
+def collect_lex_words(cache_root, split):
+    """Unique lex labels for a split (for building train-lex / val-vocab lexicons)."""
+    from stage17.common import iter_clips
+    return {_label_only(c["npz"]) for c in iter_clips(cache_root, split, ("lex",))}
+
+
+def evaluate_split_flat(model, cache_root, split, converter, flat_lex, lex_word_set,
+                        device, max_ed=2, topk=40):
+    """Like evaluate_split but uses the edit-distance flat lexicon.  lex_word_set
+    is the lexicon's word set (for coverage reporting)."""
+    import torch
+    from stage17.common import iter_clips, load_clip_npz
+    if editdistance is None:
+        raise ImportError("pip install editdistance")
+    agg = {m: {sub: {"e": 0, "l": 0, "n": 0} for sub in ("lex", "nonlex")}
+           for m in ("greedy", "lexicon")}
+    miss_cov = n_override = 0
+    clips = iter_clips(cache_root, split, ("lex", "nonlex"))
+    for i, c in enumerate(clips):
+        d = load_clip_npz(c["npz"])
+        feats = torch.from_numpy(d["feature"]).float().unsqueeze(0).to(device)
+        in_lens = torch.LongTensor([feats.shape[1]]).to(device)
+        with torch.no_grad():
+            log_probs, enc_lens = model(feats, in_lens)
+        lp = log_probs[0, : int(enc_lens[0])].float().cpu().numpy()
+        gt = d["label"]; subset = d["subset"] or c["subset"]
+        g = greedy_decode(lp, converter)
+        if subset == "lex":
+            if gt not in lex_word_set:
+                miss_cov += 1
+            lx = lexicon_decode_ed(lp, flat_lex, g, converter, max_ed=max_ed, topk=topk)
+            if lx != g:
+                n_override += 1
+        else:
+            lx = g
+        for m, pred in (("greedy", g), ("lexicon", lx)):
+            err = min(editdistance.eval(gt, pred), len(gt))
+            agg[m][subset]["e"] += err; agg[m][subset]["l"] += len(gt); agg[m][subset]["n"] += 1
+        if (i + 1) % 300 == 0 or (i + 1) == len(clips):
+            lg = agg["greedy"]["lex"]; ll = agg["lexicon"]["lex"]
+            print(f"  [{i+1}/{len(clips)}] lex greedy={lg['e']/max(lg['l'],1):.4f} "
+                  f"lexicon={ll['e']/max(ll['l'],1):.4f}", flush=True)
+
+    def cer(dd, sub): return dd[sub]["e"] / max(dd[sub]["l"], 1)
+    def overall(dd):
+        e = dd["lex"]["e"] + dd["nonlex"]["e"]; l = dd["lex"]["l"] + dd["nonlex"]["l"]
+        return e / max(l, 1)
+    n_lex = agg["greedy"]["lex"]["n"]
+    return {
+        "eval_split": split, "max_ed": max_ed, "topk": topk,
+        "lexicon_size": len(lex_word_set),
+        "lex_coverage": 1.0 - miss_cov / max(n_lex, 1),
+        "n_lex_overridden_by_lexicon": n_override,
+        "greedy": {"lex": cer(agg["greedy"], "lex"), "nonlex": cer(agg["greedy"], "nonlex"),
+                   "overall": overall(agg["greedy"])},
+        "lexicon": {"lex": cer(agg["lexicon"], "lex"), "nonlex": cer(agg["lexicon"], "nonlex"),
+                    "overall": overall(agg["lexicon"])},
+        "paper_baseline": {"lex": 0.281, "nonlex": 0.365, "overall": 0.2924},
+    }
+
+
 def print_result(res):
     print("=" * 64)
     print(f"  STAGE 11 + LEXICON DECODE — {res['eval_split'].upper()}")
